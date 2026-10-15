@@ -1,0 +1,8 @@
+/target/
+/cli-target/
+/dist/
+/package/
+*.pdb
+*.dSYM/
+.DS_Store
+__pycache__/

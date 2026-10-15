@@ -1,0 +1,131 @@
+{
+  "rust_version": "1.99.0",
+  "corpus_sha256": "c811d9f6c45c16a37a465f47481d0aac8def92657181cd2ed43cb119536c2dd4",
+  "license_expressions": [
+    "(MIT OR Apache-2.0) AND Unicode-3.0",
+    "0BSD OR MIT OR Apache-2.0",
+    "Apache-2.0",
+    "Apache-2.0 AND MIT",
+    "Apache-2.0 OR MIT",
+    "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT",
+    "Apache-2.0/MIT",
+    "BSD-2-Clause",
+    "BSD-2-Clause OR Apache-2.0 OR MIT",
+    "BSD-3-Clause",
+    "BSD-3-Clause OR Apache-2.0",
+    "BSD-3-Clause OR MIT OR Apache-2.0",
+    "BSL-1.0",
+    "CC0-1.0 OR Apache-2.0",
+    "GPL-3.0-only OR LicenseRef-Slint-Royalty-free-2.0 OR LicenseRef-Slint-Software-3.0",
+    "ISC",
+    "MIT",
+    "MIT OR Apache-2.0",
+    "MIT OR Apache-2.0 OR Zlib",
+    "MIT OR Zlib OR Apache-2.0",
+    "MIT/Apache-2.0",
+    "Unicode-3.0",
+    "Unlicense OR MIT",
+    "Zlib",
+    "Zlib OR Apache-2.0 OR MIT"
+  ],
+  "upstream": {
+    "https://github.com/AccessKit/accesskit": {
+      "packages": [
+        "accesskit",
+        "accesskit_atspi_common",
+        "accesskit_consumer",
+        "accesskit_macos",
+        "accesskit_unix",
+        "accesskit_windows",
+        "accesskit_winit"
+      ],
+      "files": [
+        "LICENSE-APACHE",
+        "LICENSE-MIT",
+        "LICENSE.chromium"
+      ]
+    },
+    "https://github.com/madsmtm/objc2": {
+      "packages": [
+        "block2",
+        "dispatch2",
+        "objc-sys",
+        "objc2",
+        "objc2-app-kit",
+        "objc2-core-foundation",
+        "objc2-core-graphics",
+        "objc2-core-text",
+        "objc2-encode",
+        "objc2-foundation",
+        "objc2-quartz-core"
+      ],
+      "files": [
+        "LICENSE.md",
+        "LICENSE.txt"
+      ]
+    },
+    "https://github.com/DoumanAsh/clipboard-win": {
+      "packages": [
+        "clipboard-win"
+      ],
+      "files": [
+        "LICENSE"
+      ]
+    },
+    "https://github.com/nical/lyon": {
+      "packages": [
+        "lyon_algorithms",
+        "lyon_extra",
+        "lyon_geom",
+        "lyon_path"
+      ],
+      "files": [
+        "LICENSE-APACHE",
+        "LICENSE-MIT"
+      ]
+    },
+    "https://github.com/DioxusLabs/taffy": {
+      "packages": [
+        "taffy"
+      ],
+      "files": [
+        "LICENSE.md"
+      ]
+    }
+  },
+  "fonts": {
+    "i-slint-common": {
+      "files": {
+        "sharedfontique/Inter-VariableFont.ttf": "c333e1de6d6241530a473f480cd1f59a2578cd509825828b89a751c09fb9b61c",
+        "sharedfontique/Inter-VariableFont.ttf.license": "ca9503edfbd471111ee0beffef07104aa45c5ded6764ba3e8c1f381bcaa641c1"
+      },
+      "notices": [
+        194,
+        193
+      ]
+    },
+    "sctk-adwaita": {
+      "files": {
+        "src/title/Cantarell-Regular.ttf": "d15f25bcdaba2e25f54c32d4e29e68fedeb1b7a1d8fbc83f7c4475916e93b55f"
+      },
+      "notices": [
+        195,
+        193
+      ],
+      "provenance": "    // !!!\n    // This code is heavily \"inspired\" by https://gitlab.com/snakedye/snui/\n    // So technically it should be licensed under MPL-2.0, sorry about that 🥺 👉👈\n    // !!!"
+    }
+  },
+  "pinned_missing": {
+    "dispatch": {
+      "version": "0.2.0",
+      "commit": "82d6c7a5b75dc0c71c3f46f87bb6c16a476f7748",
+      "license": "MIT",
+      "notices": [
+        23,
+        51
+      ]
+    }
+  },
+  "mit_terms": 23,
+  "slint_copyright": 87
+}

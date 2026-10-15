@@ -1,0 +1,1150 @@
+// AIDA-inspired reference layout, connected to the shared benchmark frontend.
+// Result rows share four value columns; system and settings rows retain compact fields.
+
+export global Palette {
+    // Neutral-dark variant from realies/claude, claude/great-rubin-4s36m9.
+    out property <color> window: #202020;
+    out property <color> panel: #181818;
+    out property <color> panel-border: #242424;
+    out property <color> text: #ffffff;
+    out property <color> text-dim: #b8b8b8;
+    out property <color> field: #202020;
+    out property <color> field-border: #383838;
+    out property <color> control: #333333;
+    out property <color> control-border: #4a4a4a;
+    out property <color> accent: #5cb3c9;
+    out property <color> on-accent: #0b1f25;
+    out property <color> icon: #3f93ab;
+    out property <color> focus: #a8e4f5;
+    out property <color> error: #ffd7d0;
+    out property <color> progress-running: #2f6f80;
+    out property <color> progress-done: #2f5c69;
+    out property <color> button: #2a2a2a;
+    out property <color> button-border: #303030;
+    out property <color> primary: #5cb3c9;
+    out property <color> primary-border: #5cb3c9;
+}
+
+component RowLabel inherits Text {
+    color: Palette.text;
+    vertical-alignment: center;
+    overflow: elide;
+}
+
+component InfoDot inherits Rectangle {
+    width: 14px;
+    height: 14px;
+    border-radius: 7px;
+    background: Palette.icon;
+
+    Rectangle {
+        x: 6px;
+        y: 3px;
+        width: 2px;
+        height: 2px;
+        border-radius: 1px;
+        background: #ffffff;
+    }
+
+    Rectangle {
+        x: 6.1px;
+        y: 6px;
+        width: 1.8px;
+        height: 4.6px;
+        border-radius: 0.9px;
+        background: #ffffff;
+    }
+}
+
+// Column title with an info dot; hovering it explains the test.
+component ColumnHeader inherits Rectangle {
+    in property <string> text;
+    in property <string> info;
+    in property <bool> active;
+    height: 18px;
+
+    HorizontalLayout {
+        alignment: center;
+        spacing: 6px;
+
+        Text {
+            text: root.text;
+            color: root.active ? Palette.focus : Palette.text;
+            vertical-alignment: center;
+        }
+
+        VerticalLayout {
+            alignment: center;
+            InfoDot { }
+        }
+    }
+
+    Tooltip {
+        Rectangle {
+            background: Palette.field;
+            border-width: 1phx;
+            border-color: Palette.field-border;
+            border-radius: 3px;
+
+            HorizontalLayout {
+                padding-left: 8px;
+                padding-right: 8px;
+                padding-top: 5px;
+                padding-bottom: 5px;
+
+                Text {
+                    text: root.info;
+                    color: Palette.text;
+                    wrap: word-wrap;
+                    max-width: 220px;
+                }
+            }
+        }
+    }
+}
+
+component FieldFrame inherits Rectangle {
+    height: 22px;
+    background: Palette.field;
+    border-radius: 3px;
+}
+
+// Result boxes keep the same appearance in every interaction and run state.
+component Readout inherits FieldFrame {
+    in property <string> value;
+    in property <string> unit;
+    in property <string> info;
+    in property <string> label;
+    in property <bool> enabled: true;
+    callback activated;
+    accessible-role: button;
+    accessible-label: root.label + (root.value == "" ? "" : " " + root.value + " " + root.unit);
+    accessible-value: root.value == "" ? "" : root.value + " " + root.unit;
+    accessible-enabled: root.enabled;
+    accessible-action-default => { root.activate(); }
+    forward-focus: fs;
+
+    function activate() {
+        if root.enabled { root.activated(); }
+    }
+
+    HorizontalLayout {
+        alignment: center;
+        spacing: 2px;
+
+        if root.value != "": Text {
+            text: root.value;
+            color: Palette.text;
+            font-size: 11px;
+            vertical-alignment: center;
+        }
+
+        // Nudged down so the smaller unit shares the value's baseline.
+        if root.value != "": VerticalLayout {
+            padding-top: 2px;
+
+            Text {
+                text: root.unit;
+                color: Palette.text-dim;
+                font-size: 9px;
+                vertical-alignment: center;
+            }
+        }
+    }
+    Tooltip {
+        Rectangle {
+            background: Palette.field;
+            border-width: 1phx;
+            border-color: Palette.field-border;
+            HorizontalLayout {
+                padding: 6px;
+                Text {
+                    text: root.info + "\nDouble-click to run this test, or focus it and press Enter or Space.";
+                    color: Palette.text;
+                    wrap: word-wrap;
+                    max-width: 300px;
+                }
+            }
+        }
+    }
+    fs := FocusScope {
+        enabled: root.enabled;
+        focus-on-click: false;
+        key-pressed(event) => {
+            if root.enabled && (event.text == Key.Return || event.text == " ") {
+                root.activate();
+                return accept;
+            }
+            return reject;
+        }
+        TouchArea {
+            enabled: root.enabled;
+            // Pointer clicks do not acquire keyboard focus or its outline.
+            double-clicked => {
+                root.activate();
+            }
+        }
+    }
+}
+
+component InfoField inherits FieldFrame {
+    in property <string> text;
+
+    HorizontalLayout {
+        padding-left: 7px;
+        padding-right: 7px;
+
+        Text {
+            text: root.text;
+            color: Palette.text;
+            vertical-alignment: center;
+            overflow: elide;
+            min-width: 0px;
+            preferred-width: 0px;
+            horizontal-stretch: 1;
+            wrap: no-wrap;
+        }
+    }
+    Tooltip {
+        Rectangle {
+            background: Palette.field;
+            border-width: 1phx;
+            border-color: Palette.field-border;
+            HorizontalLayout {
+                padding: 6px;
+                Text { text: root.text; color: Palette.text; wrap: word-wrap; max-width: 340px; }
+            }
+        }
+    }
+}
+
+export struct Choice { label: string, value: string }
+export struct Cell { value: string, info: string }
+export struct ResultRow { level: int, label: string, context: string, cells: [Cell] }
+
+component Chevron inherits Path {
+    width: 10px;
+    height: 10px;
+    viewbox-width: 10;
+    viewbox-height: 10;
+    commands: "M 2 3.5 L 5 6.5 L 8 3.5";
+    stroke: Palette.text;
+    stroke-width: 1.3px;
+    stroke-line-cap: round;
+    stroke-line-join: round;
+}
+
+component Combo inherits FieldFrame {
+    in property <[Choice]> model;
+    in-out property <int> current-index: -1;
+    in property <string> label;
+    in property <bool> enabled: true;
+    callback selected(index: int);
+    private property <int> highlighted-index: -1;
+    private property <string> display-text: root.current-index >= 0 && root.current-index < root.model.length ? root.model[root.current-index].label : "Auto";
+
+    opacity: root.enabled ? 1 : 0.5;
+    accessible-role: combobox;
+    accessible-label: root.label;
+    accessible-value: root.display-text;
+    accessible-enabled: root.enabled;
+    accessible-expandable: true;
+    accessible-expanded: popup.is-open;
+    accessible-action-default => { root.open(); }
+    accessible-action-expand => { root.open(); }
+    forward-focus: fs;
+
+    function open() {
+        if !root.enabled || root.model.length == 0 { return; }
+        root.highlighted-index = max(0, min(root.model.length - 1, root.current-index));
+        popup.show();
+    }
+    function choose(index: int) {
+        if !root.enabled || index < 0 || index >= root.model.length { return; }
+        let different = index != root.current-index;
+        root.current-index = index;
+        popup.close();
+        fs.focus();
+        if different { root.selected(index); }
+    }
+    function handle-key(event: KeyEvent) -> EventResult {
+        if !root.enabled || root.model.length == 0 { return reject; }
+        if event.text == Key.UpArrow || event.text == Key.DownArrow {
+            let step = event.text == Key.UpArrow ? -1 : 1;
+            if popup.is-open {
+                root.highlighted-index = max(0, min(root.model.length - 1, root.highlighted-index + step));
+            } else {
+                root.choose(max(0, min(root.model.length - 1, root.current-index + step)));
+            }
+            return accept;
+        }
+        if event.text == Key.Return || event.text == " " {
+            if popup.is-open { root.choose(root.highlighted-index); }
+            else { root.open(); }
+            return accept;
+        }
+        if event.text == Key.Escape && popup.is-open {
+            popup.close();
+            fs.focus();
+            return accept;
+        }
+        return reject;
+    }
+    changed enabled => { if !root.enabled { popup.close(); } }
+
+    HorizontalLayout {
+        padding-left: 7px;
+        padding-right: 6px;
+        spacing: 4px;
+        Text {
+            text: root.display-text;
+            color: Palette.text;
+            vertical-alignment: center;
+            overflow: elide;
+            horizontal-stretch: 1;
+        }
+        VerticalLayout {
+            alignment: center;
+            Chevron { }
+        }
+    }
+    fs := FocusScope {
+        enabled: root.enabled;
+        focus-on-click: false;
+        key-pressed(event) => { return root.handle-key(event); }
+        touch := TouchArea {
+            enabled: root.enabled;
+            clicked => {
+                if root.enabled {
+                    fs.focus();
+                    if popup.is-open { popup.close(); } else { root.open(); }
+                }
+            }
+        }
+    }
+    Tooltip {
+        Rectangle {
+            background: Palette.field;
+            border-width: 1phx;
+            border-color: Palette.field-border;
+            HorizontalLayout {
+                padding: 6px;
+                Text { text: root.display-text; color: Palette.text; }
+            }
+        }
+    }
+    popup := PopupWindow {
+        x: 0;
+        y: root.height + 2px;
+        width: root.width;
+        close-policy: close-on-click-outside;
+        forward-focus: popup-fs;
+        popup-fs := FocusScope {
+            enabled: root.enabled;
+            accessible-role: list;
+            accessible-label: root.label;
+            accessible-enabled: root.enabled;
+            accessible-delegate-focus: root.highlighted-index;
+            key-pressed(event) => { return root.handle-key(event); }
+            Rectangle {
+                background: Palette.control;
+                border-radius: 3px;
+                border-width: 1phx;
+                border-color: Palette.control-border;
+                VerticalLayout {
+                    padding: 2px;
+                    for item[index] in root.model: Rectangle {
+                        height: 22px;
+                        background: item-touch.has-hover || index == root.highlighted-index ? Palette.accent : transparent;
+                        accessible-role: list-item;
+                        accessible-label: item.label;
+                        accessible-enabled: root.enabled;
+                        accessible-item-selectable: true;
+                        accessible-item-selected: index == root.highlighted-index;
+                        accessible-item-index: index;
+                        accessible-action-default => { root.choose(index); }
+                        HorizontalLayout {
+                            padding-left: 6px;
+                            padding-right: 6px;
+                            Text {
+                                text: item.label;
+                                color: item-touch.has-hover || index == root.highlighted-index ? Palette.on-accent : Palette.text;
+                                vertical-alignment: center;
+                                overflow: elide;
+                            }
+                        }
+                        item-touch := TouchArea {
+                            enabled: root.enabled;
+                            clicked => { root.choose(index); }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+component Segment inherits Rectangle {
+    in property <string> text;
+    in property <bool> selected;
+    in property <bool> enabled: true;
+    callback clicked;
+
+    horizontal-stretch: 1;
+    background: root.selected ? Palette.accent : Palette.field;
+    border-radius: 3px;
+    accessible-role: radio-button;
+    accessible-label: root.text;
+    accessible-checkable: true;
+    accessible-checked: root.selected;
+    accessible-enabled: root.enabled;
+    accessible-action-default => {
+        if root.enabled { root.clicked(); }
+    }
+
+    Text {
+        text: root.text;
+        color: root.selected ? Palette.on-accent : Palette.text;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    TouchArea {
+        enabled: root.enabled;
+        clicked => {
+            if root.enabled { root.clicked(); }
+        }
+    }
+}
+
+// Full / Quick run length (replaces the old "Quick run" checkbox).
+component ModeToggle inherits FieldFrame {
+    in-out property <bool> quick;
+    in property <bool> enabled: true;
+    callback toggled(quick: bool);
+    accessible-role: radio-group;
+    accessible-label: "Run mode";
+    accessible-enabled: root.enabled;
+    accessible-delegate-focus: root.quick ? 1 : 0;
+
+    opacity: root.enabled ? 1 : 0.5;
+    clip: true;
+    forward-focus: fs;
+
+    fs := FocusScope {
+        enabled: root.enabled;
+        focus-on-click: false;
+        key-pressed(event) => {
+            if !root.enabled { return reject; }
+            if event.text == " " || event.text == Key.LeftArrow || event.text == Key.RightArrow {
+                root.quick = event.text == Key.LeftArrow ? false : event.text == Key.RightArrow ? true : !root.quick;
+                root.toggled(root.quick);
+                return accept;
+            }
+            return reject;
+        }
+
+        HorizontalLayout {
+            Segment {
+                text: "Full";
+                selected: !root.quick;
+                enabled: root.enabled;
+                clicked => {
+                    fs.focus();
+                    if root.enabled && root.quick {
+                        root.quick = false;
+                        root.toggled(false);
+                    }
+                }
+            }
+
+            Segment {
+                text: "Quick";
+                selected: root.quick;
+                enabled: root.enabled;
+                clicked => {
+                    fs.focus();
+                    if root.enabled && !root.quick {
+                        root.quick = true;
+                        root.toggled(true);
+                    }
+                }
+            }
+        }
+    }
+}
+
+component StatusBar inherits FieldFrame {
+    in property <float> progress;
+    in property <bool> running;
+    in property <bool> done;
+    in property <bool> error;
+    in property <string> text;
+    in property <string> detail;
+    height: root.error ? max(32px, error-text.preferred-height + 10px) : 22px;
+    clip: true;
+    accessible-role: progress-indicator;
+    accessible-label: root.text;
+    accessible-value: root.detail;
+
+    Rectangle {
+        visible: !root.error;
+        x: 0;
+        y: 0;
+        height: parent.height;
+        width: parent.width * max(0, min(1, root.progress));
+        border-radius: 3px;
+        background: root.running ? Palette.progress-running : Palette.progress-done;
+    }
+    if !root.error: HorizontalLayout {
+        padding-left: 7px;
+        padding-right: 7px;
+        spacing: 6px;
+        if root.done: VerticalLayout {
+            alignment: center;
+            Path {
+                width: 10px;
+                height: 10px;
+                viewbox-width: 10;
+                viewbox-height: 10;
+                commands: "M 1.5 5.2 L 3.8 7.5 L 8.5 2.5";
+                stroke: Palette.text;
+                stroke-width: 1.5px;
+                stroke-line-cap: round;
+                stroke-line-join: round;
+            }
+        }
+        Text {
+            text: root.text;
+            color: Palette.text;
+            vertical-alignment: center;
+            overflow: elide;
+            horizontal-stretch: 1;
+        }
+        Text {
+            text: root.detail;
+            color: Palette.text;
+            vertical-alignment: center;
+        }
+    }
+    error-text := Text {
+        visible: root.error;
+        x: 7px;
+        y: 5px;
+        width: parent.width - 14px;
+        height: self.preferred-height;
+        text: root.text;
+        color: Palette.error;
+        wrap: word-wrap;
+    }
+}
+component AidaButton inherits Rectangle {
+    in property <string> text;
+    in property <length> text-size: 12px;
+    in property <bool> primary;
+    in property <bool> enabled: true;
+    callback clicked;
+
+    height: 26px;
+    border-radius: 3px;
+    border-width: 1phx;
+    border-color: root.primary ? Palette.primary-border : Palette.button-border;
+    background: root.primary ? Palette.primary : Palette.button;
+    opacity: root.enabled ? 1 : 0.45;
+    accessible-role: button;
+    accessible-label: root.text;
+    accessible-enabled: root.enabled;
+    forward-focus: fs;
+    accessible-action-default => {
+        if root.enabled {
+            root.clicked();
+        }
+    }
+
+    // Hover / pressed tint.
+    Rectangle {
+        x: 1phx;
+        y: 1phx;
+        width: parent.width - 2phx;
+        height: parent.height - 2phx;
+        border-radius: 2px;
+        background: !root.enabled ? transparent : touch.pressed ? #00000026 : touch.has-hover ? #ffffff1a : fs.has-focus ? #ffffff0d : transparent;
+    }
+
+    Text {
+        text: root.text;
+        color: root.primary ? Palette.on-accent : Palette.text;
+        font-size: root.text-size;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    fs := FocusScope {
+        enabled: root.enabled;
+        focus-on-click: false;
+        key-pressed(event) => {
+            if root.enabled && (event.text == " " || event.text == Key.Return) {
+                root.clicked();
+                return accept;
+            }
+            return reject;
+        }
+
+        touch := TouchArea {
+            enabled: root.enabled;
+            clicked => {
+                if root.enabled {
+                    root.clicked();
+                }
+            }
+        }
+    }
+}
+
+export component MemtestWindow inherits Window {
+    in property <string> version;
+    title: "memtest " + root.version;
+    icon: @image-url("../assets/memtest.svg");
+    no-frame: true;
+    width: 456px;
+    height: 394px + max(0, root.rows.length - 1) * 26px + (root.modules != "" ? 26px : 0px)
+        + (root.board != "" ? 26px : 0px) + (root.bios != "" ? 26px : 0px)
+        + (root.error ? status-bar.height - 22px : 0px);
+    background: Palette.window;
+    default-font-size: 12px;
+
+    // Rows and cells are formatted by Rust. Empty values have not been measured.
+    in property <[ResultRow]> rows;
+    in property <int> active-level: -1;
+    // 0 read, 1 write, 2 copy, 3 latency, -1 none.
+    in property <int> active-column: -1;
+
+    // System info.
+    in property <string> cpu;
+    in property <string> threads;
+    in-out property <string> code-path: "auto";
+    in property <[Choice]> code-path-options;
+    in-out property <int> code-path-index;
+    in property <string> memory;
+    in property <string> modules;
+    in property <string> board;
+    in property <string> board-label: "Board";
+    in property <string> bios;
+    in property <string> os;
+
+    in-out property <string> workers;
+    in-out property <string> bandwidth;
+    in-out property <string> latency;
+    in property <[Choice]> worker-options;
+    in property <[Choice]> bandwidth-options;
+    in property <[Choice]> latency-options;
+    in-out property <int> worker-index: -1;
+    in-out property <int> bandwidth-index: -1;
+    in-out property <int> latency-index: -1;
+    in property <[Choice]> store-options;
+    in-out property <int> store-index;
+    in-out property <string> store-policy: "streaming";
+    in property <[Choice]> locality-options;
+    in-out property <int> locality-index;
+    in-out property <string> locality;
+    in-out property <bool> quick;
+    in property <bool> quick-allowed: true;
+
+    // Run state.
+    in-out property <bool> busy;
+    in-out property <bool> error;
+    in property <float> progress; // 0..1
+    in-out property <string> status: "Ready";
+    in property <string> elapsed;
+    in property <string> details;
+    in property <bool> has-results;
+
+    // (-1, -1) runs the suite; (level, -1) a row; (level, 0..3) one cell.
+    callback start(level: int, column: int);
+    callback settings-changed();
+    callback save();
+    callback minimize-window();
+    callback close-window();
+
+    property <length> label-w: 64px;
+    property <length> panel-padding: 12px;
+    property <length> field-gap: 4px;
+    property <length> content-w: panel.width - 2 * root.panel-padding;
+    property <length> col-w: (root.content-w - root.label-w - 3 * root.field-gap) / 3;
+    property <length> result-w: (root.content-w - root.label-w - 4 * root.field-gap) / 4;
+
+    // The title bar belongs to the scene, so saved images include it on every OS.
+    Rectangle {
+        border-width: 1phx;
+        border-color: Palette.panel-border;
+    }
+    WindowMoveArea {
+        x: 12px;
+        y: 0px;
+        width: parent.width - 88px;
+        height: 32px;
+        Image {
+            x: 0px;
+            y: 8px;
+            width: 16px;
+            height: 16px;
+            source: @image-url("../assets/memtest.svg");
+        }
+        Text {
+            x: 24px;
+            width: parent.width - 24px;
+            height: parent.height;
+            text: root.title;
+            color: Palette.text;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+    }
+    AidaButton {
+        x: parent.width - 76px;
+        y: 4px;
+        width: 32px;
+        height: 24px;
+        text: "−";
+        text-size: 16px;
+        accessible-label: "Minimize";
+        background: transparent;
+        border-width: 0px;
+        clicked => { root.minimize-window(); }
+    }
+    AidaButton {
+        x: parent.width - 40px;
+        y: 4px;
+        width: 32px;
+        height: 24px;
+        text: "×";
+        text-size: 16px;
+        accessible-label: "Close";
+        background: transparent;
+        border-width: 0px;
+        clicked => { root.close-window(); }
+    }
+
+    VerticalLayout {
+        y: 32px;
+        height: root.height - 32px;
+        padding-left: 8px;
+        padding-right: 8px;
+
+        panel := Rectangle {
+            background: Palette.panel;
+            border-width: 1phx;
+            border-color: Palette.panel-border;
+            border-radius: 6px;
+
+            VerticalLayout {
+                padding: root.panel-padding;
+                padding-top: 10px;
+                alignment: LayoutAlignment.start;
+
+                // Results
+                VerticalLayout {
+                    spacing: root.field-gap;
+
+                    HorizontalLayout {
+                        spacing: root.field-gap;
+                        Rectangle {
+                            width: root.label-w;
+                        }
+
+                        ColumnHeader {
+                            width: root.result-w;
+                            text: "Read";
+                            active: root.busy && root.active-column == 0;
+                            info: "Sequential read bandwidth across workers. Memory: decimal MB/s. Caches: decimal GB/s. Hover a cell for its footprint and worker count.";
+                        }
+
+                        ColumnHeader {
+                            width: root.result-w;
+                            text: "Write";
+                            active: root.busy && root.active-column == 1;
+                            info: "Sequential write bandwidth across workers. RAM follows the Stores setting; caches use cached stores. ARM streaming uses non-temporal hints.";
+                        }
+
+                        ColumnHeader {
+                            width: root.result-w;
+                            text: "Copy";
+                            active: root.busy && root.active-column == 2;
+                            info: "Memory copy; RAM follows the Stores setting. Rate counts combined bytes read + written. Hover a cell for buffer sizes.";
+                        }
+
+                        ColumnHeader {
+                            width: root.result-w;
+                            text: "Latency";
+                            active: root.busy && root.active-column == 3;
+                            info: "Median dependent-load latency through a seeded pointer chain, in ns per load.";
+                        }
+                    }
+
+                    for row in root.rows: HorizontalLayout {
+                        spacing: root.field-gap;
+                        Rectangle {
+                            width: root.label-w;
+                            height: 22px;
+                            accessible-role: button;
+                            accessible-label: row.label + " Read, Write, Copy and Latency";
+                            accessible-enabled: !root.busy;
+                            accessible-action-default => {
+                                if !root.busy { root.start(row.level, -1); }
+                            }
+                            forward-focus: row-focus;
+                            RowLabel {
+                                x: 0;
+                                y: 0;
+                                width: parent.width;
+                                height: parent.height;
+                                text: row.label;
+                                horizontal-alignment: left;
+                                color: (root.busy && root.active-level == row.level) || row-focus.has-focus ? Palette.focus : Palette.text;
+                            }
+                            Tooltip {
+                                Rectangle {
+                                    background: Palette.field;
+                                    border-width: 1phx;
+                                    border-color: Palette.field-border;
+                                    HorizontalLayout {
+                                        padding: 6px;
+                                        Text {
+                                            text: row.context + "\nDouble-click to run all four tests in this row, or focus it and press Enter or Space.";
+                                            color: Palette.text;
+                                            wrap: word-wrap;
+                                            max-width: 300px;
+                                        }
+                                    }
+                                }
+                            }
+                            row-focus := FocusScope {
+                                enabled: !root.busy;
+                                focus-on-click: false;
+                                key-pressed(event) => {
+                                    if !root.busy && (event.text == Key.Return || event.text == " ") {
+                                        root.start(row.level, -1);
+                                        return accept;
+                                    }
+                                    return reject;
+                                }
+                                TouchArea {
+                                    enabled: !root.busy;
+                                    double-clicked => {
+                                        if !root.busy { root.start(row.level, -1); }
+                                    }
+                                }
+                            }
+                        }
+                        for cell[column] in row.cells: Readout {
+                            width: root.result-w;
+                            value: cell.value;
+                            info: cell.info;
+                            unit: column == 3 ? "ns" : row.level == 0 ? "MB/s" : "GB/s";
+                            label: row.label + " " + (column == 0 ? "Read" : column == 1 ? "Write" : column == 2 ? "Copy" : "Latency");
+                            enabled: !root.busy;
+                            activated => { if !root.busy { root.start(row.level, column); } }
+                        }
+                    }
+                }
+
+                Rectangle {
+                    height: 18px;
+                }
+
+                // System
+                VerticalLayout {
+                    spacing: root.field-gap;
+
+                    HorizontalLayout {
+                        spacing: root.field-gap;
+                        RowLabel {
+                            width: root.label-w;
+                            text: "CPU";
+                        }
+
+                        InfoField {
+                            text: root.cpu;
+                        }
+                    }
+
+                    HorizontalLayout {
+                        spacing: root.field-gap;
+                        RowLabel {
+                            width: root.label-w;
+                            text: "Threads";
+                        }
+
+                        InfoField {
+                            width: root.col-w;
+                            text: root.threads;
+                        }
+
+                        RowLabel {
+                            width: root.col-w;
+                            text: "Code Path";
+                            horizontal-alignment: right;
+                        }
+
+                        Combo {
+                            width: root.col-w;
+                            label: "Bandwidth instruction set";
+                            model: root.code-path-options;
+                            current-index <=> root.code-path-index;
+                            enabled: !root.busy;
+                            selected(index) => {
+                                if !root.busy {
+                                    root.code-path = root.code-path-options[index].value;
+                                    root.settings-changed();
+                                }
+                            }
+                        }
+                    }
+
+                    HorizontalLayout {
+                        spacing: root.field-gap;
+                        RowLabel {
+                            width: root.label-w;
+                            text: "Memory";
+                        }
+
+                        InfoField {
+                            text: root.memory;
+                        }
+                    }
+
+                    if root.modules != "": HorizontalLayout {
+                        spacing: root.field-gap;
+                        RowLabel { width: root.label-w; text: "Modules"; }
+                        InfoField { text: root.modules; }
+                    }
+
+                    if root.board != "": HorizontalLayout {
+                        spacing: root.field-gap;
+                        RowLabel { width: root.label-w; text: root.board-label; }
+                        InfoField { text: root.board; }
+                    }
+
+                    if root.bios != "": HorizontalLayout {
+                        spacing: root.field-gap;
+                        RowLabel { width: root.label-w; text: "BIOS"; }
+                        InfoField { text: root.bios; }
+                    }
+
+                    HorizontalLayout {
+                        spacing: root.field-gap;
+                        RowLabel {
+                            width: root.label-w;
+                            text: "OS";
+                        }
+
+                        InfoField {
+                            text: root.os;
+                        }
+                    }
+                }
+
+                Rectangle {
+                    height: 18px;
+                }
+
+                // Settings, greyed out while a run is in progress.
+                Rectangle {
+                    vertical-stretch: 0;
+                    VerticalLayout {
+                        spacing: root.field-gap;
+
+                        HorizontalLayout {
+                            spacing: root.field-gap;
+                            RowLabel { width: root.label-w; text: "Stores"; }
+                            Combo {
+                                width: root.col-w;
+                                label: "RAM store policy";
+                                model: root.store-options;
+                                current-index <=> root.store-index;
+                                enabled: !root.busy;
+                                selected(index) => {
+                                    root.store-policy = root.store-options[index].value;
+                                    root.settings-changed();
+                                }
+                            }
+                            RowLabel { width: root.col-w; text: "Locality"; horizontal-alignment: right; }
+                            Combo {
+                                width: root.col-w;
+                                label: "Memory latency locality";
+                                model: root.locality-options;
+                                current-index <=> root.locality-index;
+                                enabled: !root.busy;
+                                selected(index) => {
+                                    root.locality = root.locality-options[index].value;
+                                    root.settings-changed();
+                                }
+                            }
+                        }
+
+                        HorizontalLayout {
+                            spacing: root.field-gap;
+                            RowLabel {
+                                width: root.label-w;
+                                text: "Workers";
+                            }
+
+                            Combo {
+                                width: root.col-w;
+                                label: "Workers";
+                                model: root.worker-options;
+                                current-index <=> root.worker-index;
+                                enabled: !root.busy;
+                                selected(index) => {
+                                    if !root.busy {
+                                        root.workers = root.worker-options[index].value;
+                                        root.settings-changed();
+                                    }
+                                }
+                            }
+
+                            RowLabel {
+                                width: root.col-w;
+                                text: "R/W Buffer";
+                                horizontal-alignment: right;
+                            }
+
+                            Combo {
+                                width: root.col-w;
+                                label: "Total read/write buffer";
+                                model: root.bandwidth-options;
+                                current-index <=> root.bandwidth-index;
+                                enabled: !root.busy;
+                                selected(index) => {
+                                    if !root.busy {
+                                        root.bandwidth = root.bandwidth-options[index].value;
+                                        root.settings-changed();
+                                    }
+                                }
+                            }
+                        }
+
+                        HorizontalLayout {
+                            spacing: root.field-gap;
+                            RowLabel {
+                                width: root.label-w;
+                                text: "Mode";
+                            }
+
+                            ModeToggle {
+                                width: root.col-w;
+                                quick <=> root.quick;
+                                enabled: !root.busy && root.quick-allowed;
+                                toggled(quick) => { root.settings-changed(); }
+                            }
+
+                            RowLabel {
+                                width: root.col-w;
+                                text: "Latency Buffer";
+                                horizontal-alignment: right;
+                            }
+
+                            Combo {
+                                width: root.col-w;
+                                label: "Latency buffer";
+                                model: root.latency-options;
+                                current-index <=> root.latency-index;
+                                enabled: !root.busy;
+                                selected(index) => {
+                                    if !root.busy {
+                                        root.latency = root.latency-options[index].value;
+                                        root.settings-changed();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                Rectangle {
+                    height: 18px;
+                }
+
+                // Status
+                HorizontalLayout {
+                    spacing: root.field-gap;
+                    HorizontalLayout {
+                        width: root.label-w;
+                        spacing: 6px;
+                        alignment: LayoutAlignment.start;
+                        RowLabel {
+                            text: "Status";
+                            horizontal-stretch: 0;
+                        }
+                        VerticalLayout {
+                            alignment: center;
+                            InfoDot {
+                                Tooltip {
+                                    Rectangle {
+                                        background: Palette.field;
+                                        border-width: 1phx;
+                                        border-color: Palette.field-border;
+                                        HorizontalLayout {
+                                            padding: 6px;
+                                            Text {
+                                                text: "Run settings\n" + root.details;
+                                                color: Palette.text;
+                                                wrap: word-wrap;
+                                                max-width: 300px;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    status-bar := StatusBar {
+                        progress: root.progress;
+                        running: root.busy;
+                        done: !root.busy && !root.error && root.has-results;
+                        error: root.error;
+                        text: root.status;
+                        detail: root.elapsed;
+                    }
+                }
+            }
+        }
+
+        HorizontalLayout {
+            width: panel.width;
+            spacing: root.field-gap;
+            padding-left: 2phx;
+            padding-right: 2phx;
+            padding-top: 10px;
+            padding-bottom: 10px;
+
+            AidaButton {
+                width: (panel.width - 4phx - 2 * root.field-gap) / 3;
+                text: "Save";
+                enabled: !root.busy;
+                clicked => { root.save(); }
+            }
+
+            AidaButton {
+                width: (panel.width - 4phx - 2 * root.field-gap) / 3;
+                primary: true;
+                text: root.busy ? "Running…" : "Start Benchmark";
+                enabled: !root.busy;
+                clicked => {
+                    if !root.busy {
+                        root.start(-1, -1);
+                    }
+                }
+            }
+
+            AidaButton {
+                width: (panel.width - 4phx - 2 * root.field-gap) / 3;
+                text: "Close";
+                clicked => {
+                    root.close-window();
+                }
+            }
+        }
+    }
+
+}
