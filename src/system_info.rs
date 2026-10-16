@@ -13,6 +13,23 @@ pub struct Info {
     pub os: String,
 }
 
+impl Info {
+    fn with_placeholders(mut self) -> Self {
+        for value in [
+            &mut self.memory,
+            &mut self.modules,
+            &mut self.board,
+            &mut self.bios,
+            &mut self.os,
+        ] {
+            if value.trim().is_empty() {
+                *value = "N/A".into();
+            }
+        }
+        self
+    }
+}
+
 pub fn detect(hardware: &Hardware) -> Info {
     let cpu = cpu_model().unwrap_or_else(|| match std::env::consts::ARCH {
         "aarch64" => "ARM64".into(),
@@ -40,7 +57,7 @@ pub fn detect(hardware: &Hardware) -> Info {
             capacity(hardware.memory_budget as u64)
         )
     } else {
-        "Unavailable".into()
+        "N/A".into()
     };
     #[cfg(any(windows, target_os = "linux"))]
     let details = firmware::detect();
@@ -78,6 +95,7 @@ pub fn detect(hardware: &Hardware) -> Info {
         bios: String::new(),
         os: os_name(),
     }
+    .with_placeholders()
 }
 
 fn name(text: &str) -> Option<String> {
@@ -395,7 +413,61 @@ fn sysctl(name: &[u8], data: &mut [u8]) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::pretty_name;
+    use super::{Info, pretty_name};
+
+    #[test]
+    fn missing_hardware_display_fields_use_fixed_placeholders() {
+        let info = Info {
+            cpu: "ARM64".into(),
+            memory: String::new(),
+            modules: " \t".into(),
+            board: String::new(),
+            bios: "\n".into(),
+            os: String::new(),
+        }
+        .with_placeholders();
+        assert_eq!(info.cpu, "ARM64");
+        for value in [
+            &info.memory,
+            &info.modules,
+            &info.board,
+            &info.bios,
+            &info.os,
+        ] {
+            assert_eq!(value, "N/A");
+        }
+    }
+
+    #[test]
+    fn available_hardware_values_and_system_model_identifiers_are_preserved() {
+        for (model, modules, bios) in [
+            (
+                "ASUSTeK COMPUTER INC. ProArt X870E",
+                "2 × Corsair DIMM",
+                "American Megatrends 2103",
+            ),
+            ("Mac15,6", "", ""),
+        ] {
+            let info = Info {
+                cpu: "Existing CPU".into(),
+                memory: "64 GiB existing memory description".into(),
+                modules: modules.into(),
+                board: model.into(),
+                bios: bios.into(),
+                os: "Existing OS".into(),
+            }
+            .with_placeholders();
+            assert_eq!(info.cpu, "Existing CPU");
+            assert_eq!(info.memory, "64 GiB existing memory description");
+            assert_eq!(info.board, model);
+            assert_eq!(
+                info.modules,
+                if modules.is_empty() { "N/A" } else { modules }
+            );
+            assert_eq!(info.bios, if bios.is_empty() { "N/A" } else { bios });
+            assert_eq!(info.os, "Existing OS");
+        }
+    }
 
     #[test]
     fn os_release_uses_display_name_without_shell_expansion() {

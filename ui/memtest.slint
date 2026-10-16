@@ -116,32 +116,33 @@ component Readout inherits FieldFrame {
     in property <string> info;
     in property <string> notes;
     in property <string> label;
+    in property <bool> available: true;
     in property <bool> enabled: true;
     callback activated;
     accessible-role: button;
-    accessible-label: root.label + (root.value == "" ? "" : " " + root.value + " " + root.unit);
-    accessible-value: root.value == "" ? "" : root.value + " " + root.unit;
-    accessible-enabled: root.enabled;
+    accessible-label: root.label + (!root.available ? " unavailable" : root.value == "" ? "" : " " + root.value + " " + root.unit);
+    accessible-value: !root.available ? "N/A" : root.value == "" ? "" : root.value + " " + root.unit;
+    accessible-enabled: root.enabled && root.available;
     accessible-action-default => { root.activate(); }
     forward-focus: fs;
 
     function activate() {
-        if root.enabled { root.activated(); }
+        if root.enabled && root.available { root.activated(); }
     }
 
     HorizontalLayout {
         alignment: center;
         spacing: 2px;
 
-        if root.value != "": Text {
-            text: root.value;
-            color: Palette.text;
+        if root.value != "" || !root.available: Text {
+            text: root.available ? root.value : "N/A";
+            color: root.available ? Palette.text : Palette.text-dim;
             font-size: 11px;
             vertical-alignment: center;
         }
 
         // Nudged down so the smaller unit shares the value's baseline.
-        if root.value != "": VerticalLayout {
+        if root.available && root.value != "": VerticalLayout {
             padding-top: 2px;
 
             Text {
@@ -161,7 +162,7 @@ component Readout inherits FieldFrame {
                 padding: 6px;
                 Text {
                     text: root.info + (root.notes == "" ? "" : "\n\n" + root.notes)
-                        + "\nDouble-click to run this test, or focus it and press Enter or Space.";
+                        + (root.available ? "\nDouble-click to run this test, or focus it and press Enter or Space." : "");
                     color: Palette.text;
                     wrap: word-wrap;
                     max-width: 300px;
@@ -170,17 +171,17 @@ component Readout inherits FieldFrame {
         }
     }
     fs := FocusScope {
-        enabled: root.enabled;
+        enabled: root.enabled && root.available;
         focus-on-click: false;
         key-pressed(event) => {
-            if root.enabled && (event.text == Key.Return || event.text == " ") {
+            if root.enabled && root.available && (event.text == Key.Return || event.text == " ") {
                 root.activate();
                 return accept;
             }
             return reject;
         }
         TouchArea {
-            enabled: root.enabled;
+            enabled: root.enabled && root.available;
             // Pointer clicks do not acquire keyboard focus or its outline.
             double-clicked => {
                 root.activate();
@@ -191,6 +192,7 @@ component Readout inherits FieldFrame {
 
 component InfoField inherits FieldFrame {
     in property <string> text;
+    in property <string> info: root.text;
 
     HorizontalLayout {
         padding-left: 7px;
@@ -214,7 +216,7 @@ component InfoField inherits FieldFrame {
             border-color: Palette.field-border;
             HorizontalLayout {
                 padding: 6px;
-                Text { text: root.text; color: Palette.text; wrap: word-wrap; max-width: 340px; }
+                Text { text: root.info; color: Palette.text; wrap: word-wrap; max-width: 340px; }
             }
         }
     }
@@ -222,7 +224,7 @@ component InfoField inherits FieldFrame {
 
 export struct Choice { label: string, value: string }
 export struct Cell { value: string, info: string, notes: string }
-export struct ResultRow { level: int, label: string, context: string, cells: [Cell] }
+export struct ResultRow { level: int, available: bool, label: string, context: string, cells: [Cell] }
 
 component Chevron inherits Path {
     width: 10px;
@@ -614,8 +616,7 @@ export component MemtestWindow inherits Window {
     icon: @image-url("../assets/memtest.svg");
     no-frame: true;
     width: 456px;
-    height: 394px + max(0, root.rows.length - 1) * 26px + (root.modules != "" ? 26px : 0px)
-        + (root.board != "" ? 26px : 0px) + (root.bios != "" ? 26px : 0px)
+    height: 472px + max(0, root.rows.length - 1) * 26px
         + (root.error ? status-bar.height - 22px : 0px);
     background: Palette.window;
     default-font-size: 12px;
@@ -635,7 +636,6 @@ export component MemtestWindow inherits Window {
     in property <string> memory;
     in property <string> modules;
     in property <string> board;
-    in property <string> board-label: "Board";
     in property <string> bios;
     in property <string> os;
 
@@ -795,10 +795,10 @@ export component MemtestWindow inherits Window {
                             width: root.label-w;
                             height: 22px;
                             accessible-role: button;
-                            accessible-label: row.label + " Read, Write, Copy and Latency";
-                            accessible-enabled: !root.busy;
+                            accessible-label: row.label + (row.available ? " Read, Write, Copy and Latency" : " unavailable");
+                            accessible-enabled: !root.busy && row.available;
                             accessible-action-default => {
-                                if !root.busy { root.start(row.level, -1); }
+                                if !root.busy && row.available { root.start(row.level, -1); }
                             }
                             forward-focus: row-focus;
                             RowLabel {
@@ -808,7 +808,7 @@ export component MemtestWindow inherits Window {
                                 height: parent.height;
                                 text: row.label;
                                 horizontal-alignment: left;
-                                color: (root.busy && root.active-level == row.level) || row-focus.has-focus ? Palette.focus : Palette.text;
+                                color: !row.available ? Palette.text-dim : (root.busy && root.active-level == row.level) || row-focus.has-focus ? Palette.focus : Palette.text;
                             }
                             Tooltip {
                                 Rectangle {
@@ -818,7 +818,7 @@ export component MemtestWindow inherits Window {
                                     HorizontalLayout {
                                         padding: 6px;
                                         Text {
-                                            text: row.context + "\nDouble-click to run all four tests in this row, or focus it and press Enter or Space.";
+                                            text: row.context + (row.available ? "\nDouble-click to run all four tests in this row, or focus it and press Enter or Space." : "");
                                             color: Palette.text;
                                             wrap: word-wrap;
                                             max-width: 300px;
@@ -827,19 +827,19 @@ export component MemtestWindow inherits Window {
                                 }
                             }
                             row-focus := FocusScope {
-                                enabled: !root.busy;
+                                enabled: !root.busy && row.available;
                                 focus-on-click: false;
                                 key-pressed(event) => {
-                                    if !root.busy && (event.text == Key.Return || event.text == " ") {
+                                    if !root.busy && row.available && (event.text == Key.Return || event.text == " ") {
                                         root.start(row.level, -1);
                                         return accept;
                                     }
                                     return reject;
                                 }
                                 TouchArea {
-                                    enabled: !root.busy;
+                                    enabled: !root.busy && row.available;
                                     double-clicked => {
-                                        if !root.busy { root.start(row.level, -1); }
+                                        if !root.busy && row.available { root.start(row.level, -1); }
                                     }
                                 }
                             }
@@ -849,10 +849,11 @@ export component MemtestWindow inherits Window {
                             value: cell.value;
                             info: cell.info;
                             notes: cell.notes;
+                            available: row.available;
                             unit: column == 3 ? "ns" : row.level == 0 ? "MB/s" : "GB/s";
                             label: row.label + " " + (column == 0 ? "Read" : column == 1 ? "Write" : column == 2 ? "Copy" : "Latency");
-                            enabled: !root.busy;
-                            activated => { if !root.busy { root.start(row.level, column); } }
+                            enabled: !root.busy && row.available;
+                            activated => { if !root.busy && row.available { root.start(row.level, column); } }
                         }
                     }
                 }
@@ -922,19 +923,22 @@ export component MemtestWindow inherits Window {
                         }
                     }
 
-                    if root.modules != "": HorizontalLayout {
+                    HorizontalLayout {
                         spacing: root.field-gap;
                         RowLabel { width: root.label-w; text: "Modules"; }
                         InfoField { text: root.modules; }
                     }
 
-                    if root.board != "": HorizontalLayout {
+                    HorizontalLayout {
                         spacing: root.field-gap;
-                        RowLabel { width: root.label-w; text: root.board-label; }
-                        InfoField { text: root.board; }
+                        RowLabel { width: root.label-w; text: "Model"; }
+                        InfoField {
+                            text: root.board;
+                            info: "Reported motherboard or system model.\n" + root.board;
+                        }
                     }
 
-                    if root.bios != "": HorizontalLayout {
+                    HorizontalLayout {
                         spacing: root.field-gap;
                         RowLabel { width: root.label-w; text: "BIOS"; }
                         InfoField { text: root.bios; }

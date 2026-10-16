@@ -53,8 +53,9 @@ Use `--level memory` for RAM-only comparisons.
 Double-click a result cell to run that test, or a row label to run all four.
 Other scores stay in place. Save exports the full application window as a PNG,
 including its shared title bar, icon, and version. Drag the title bar to move it.
-The window shows installed memory, module names, motherboard, and BIOS details
-when firmware exposes them. Reported memory rates are firmware configuration values.
+The window keeps cache and hardware rows in fixed positions, with `N/A` for
+unavailable values. Model shows the motherboard or system model. Reported memory
+rates are firmware configuration values.
 
 The GUI uses Slint's software renderer with its default features disabled.
 Build a CLI without third-party crates with `cargo build --release --locked --no-default-features`.
@@ -85,7 +86,9 @@ for this when the line size is known, and JSON reports the footprint separately.
 Cache bandwidth uses cached stores and private worker buffers, bounded
 by half each shared cache's capacity and sized above lower caches. Cache latency uses
 one worker with a fully shuffled, half-capacity buffer and one pointer per cache line.
-Lower-cache hits and translation costs still contribute. Unavailable levels are omitted.
+Lower-cache hits and translation costs still contribute. Unavailable cache tests
+show `N/A` in the GUI; their tooltips explain why. Apple SLC is not currently measured
+as a separate cache and is not substituted for CPU L3.
 
 By default, each test warms its buffer, calibrates toward 0.2 seconds per sample,
 and reports the median of seven samples. Range is `100 × (maximum − minimum) / median`.

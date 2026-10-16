@@ -255,6 +255,7 @@ fn preview(window: &MemtestWindow, base: &cli::Options, hardware: &platform::Har
             let plans = match crate::cache_plans(&options, hardware, &spec, &cpus) {
                 Ok(plans) => plans,
                 Err(error) => {
+                    replace_rows(window, rows(&options, &spec, &cpus, &[], hardware, false));
                     window.set_status(error.into());
                     window.set_error(true);
                     return;
@@ -323,6 +324,11 @@ struct Target {
 }
 
 impl Target {
+    fn available(self, rows: &slint::ModelRc<ResultRow>) -> bool {
+        rows.iter()
+            .any(|row| row.level == i32::from(self.level) && row.available)
+    }
+
     fn level_key(self) -> String {
         if self.level == 0 {
             "memory".into()
@@ -397,32 +403,35 @@ fn refresh_rows(
     let Some(target) = target else {
         return fresh;
     };
-    let replacement = fresh
-        .iter()
-        .find(|row| row.level == i32::from(target.level));
-    if let Some(replacement) = replacement {
-        for (index, mut row) in current
-            .iter()
-            .enumerate()
-            .filter(|(_, row)| row.level == i32::from(target.level))
+    for (index, mut row) in current.iter().enumerate() {
+        let Some(replacement) = fresh.iter().find(|fresh| fresh.level == row.level) else {
+            continue;
+        };
+        let targeted = row.level == i32::from(target.level);
+        if !targeted && row.available && replacement.available {
+            continue;
+        }
+        if let Some(column) = target.column
+            && targeted
+            && row.available
+            && replacement.available
         {
-            if let Some(column) = target.column {
-                if let (Some(cells), Some(cell)) = (
-                    row.cells.as_any().downcast_ref::<slint::VecModel<Cell>>(),
-                    replacement.cells.row_data(column),
-                ) {
-                    cells.set_row_data(column, cell);
-                }
-                row.context = "Hover a result for its tested settings.".into();
-            } else {
-                row = replacement.clone();
+            if let (Some(cells), Some(cell)) = (
+                row.cells.as_any().downcast_ref::<slint::VecModel<Cell>>(),
+                replacement.cells.row_data(column),
+            ) {
+                cells.set_row_data(column, cell);
             }
-            if let Some(rows) = current
-                .as_any()
-                .downcast_ref::<slint::VecModel<ResultRow>>()
-            {
-                rows.set_row_data(index, row);
-            }
+            row.context = "Hover a result for its tested settings.".into();
+        } else {
+            // Availability changes discard every stale value and tooltip in the row.
+            row = replacement;
+        }
+        if let Some(rows) = current
+            .as_any()
+            .downcast_ref::<slint::VecModel<ResultRow>>()
+        {
+            rows.set_row_data(index, row);
         }
     }
     current
@@ -431,12 +440,13 @@ fn refresh_rows(
 fn has_results(model: &slint::ModelRc<ResultRow>) -> bool {
     model
         .iter()
+        .filter(|row| row.available)
         .any(|row| row.cells.iter().any(|cell| !cell.value.is_empty()))
 }
 
 fn memory_notes(model: &slint::ModelRc<ResultRow>) -> String {
     let mut notes = Vec::new();
-    for row in model.iter() {
+    for row in model.iter().filter(|row| row.available) {
         for cell in row.cells.iter() {
             for note in cell.notes.lines() {
                 if !notes.iter().any(|seen| seen == note) {
@@ -489,10 +499,46 @@ fn row(level: u8, context: String, copy_context: String, latency_context: String
     .collect::<Vec<_>>();
     ResultRow {
         level: i32::from(level),
+        available: true,
         label: row_name(level).into(),
         context: context.into(),
         cells: Rc::new(slint::VecModel::from(cells)).into(),
     }
+}
+
+fn unavailable_reason(level: u8, hardware: &platform::Hardware, apple_arm: bool) -> String {
+    if hardware.caches.iter().all(|cache| cache.level != level) {
+        if level == 3 && apple_arm {
+            "macOS did not report CPU L3 cache geometry. Apple SLC is not currently measured."
+                .into()
+        } else {
+            format!("L{level} data/unified cache geometry is not reported by this system.")
+        }
+    } else if !hardware.caches.iter().any(|cache| {
+        cache.level == level
+            && cache.bytes != 0
+            && cache.line_bytes >= 8
+            && cache.line_bytes.is_power_of_two()
+    }) {
+        format!(
+            "Reported L{level} cache geometry is incomplete; a capacity and valid cache-line size are required."
+        )
+    } else {
+        format!(
+            "L{level} cache geometry is reported, but an isolated test working set is unavailable with the current CPU selection, lower-cache geometry and memory allowance."
+        )
+    }
+}
+
+fn unavailable_row(level: u8, hardware: &platform::Hardware) -> ResultRow {
+    let reason = unavailable_reason(
+        level,
+        hardware,
+        cfg!(all(target_os = "macos", target_arch = "aarch64")),
+    );
+    let mut row = row(level, reason.clone(), reason.clone(), reason);
+    row.available = false;
+    row
 }
 
 fn rows(
@@ -531,7 +577,14 @@ fn rows(
         );
         rows.push(row(0, context, copy, latency));
     }
-    for plan in plans {
+    for level in 1..=3 {
+        if options.level != "all" && options.level != format!("l{level}") {
+            continue;
+        }
+        let Some(plan) = plans.iter().find(|plan| plan.level == level) else {
+            rows.push(unavailable_row(level, hardware));
+            continue;
+        };
         let worker = if cfg!(target_os = "macos") {
             "one OS-scheduled worker".into()
         } else {
@@ -566,7 +619,7 @@ fn rows(
         spec.min_time,
         spec.seed,
     );
-    for row in &rows {
+    for row in rows.iter().filter(|row| row.available) {
         let cells = row
             .cells
             .as_any()
@@ -607,7 +660,10 @@ fn score(
     let Some(column) = column(label) else {
         return;
     };
-    for row in model.iter().filter(|row| row.level == i32::from(level)) {
+    for row in model
+        .iter()
+        .filter(|row| row.level == i32::from(level) && row.available)
+    {
         let Some(cells) = row.cells.as_any().downcast_ref::<slint::VecModel<Cell>>() else {
             return;
         };
@@ -676,9 +732,6 @@ pub fn run(options: cli::Options) -> Result<(), String> {
     window.set_modules(info.modules.into());
     window.set_board(info.board.into());
     window.set_bios(info.bios.into());
-    if cfg!(target_os = "macos") {
-        window.set_board_label("Model".into());
-    }
     window.set_threads(format!("{} available", hardware.cpus.len()).into());
     let mut backends = vec![Choice {
         label: format!(
@@ -823,7 +876,7 @@ pub fn run(options: cli::Options) -> Result<(), String> {
         }
         let resolved = (|| {
             let target = Target::parse(level, cell_column)?;
-            if target.is_some() && !window.get_rows().iter().any(|row| row.level == level) {
+            if target.is_some_and(|target| !target.available(&window.get_rows())) {
                 return Err("result row is unavailable".to_owned());
             }
             let mut options = settings(&window, &options)?;
@@ -1104,6 +1157,178 @@ mod tests {
     }
 
     #[test]
+    fn cache_placeholders_keep_order_and_explain_unavailability() {
+        let mut hardware = hardware();
+        for (level, bytes) in [(1, 32 << 10), (2, 512 << 10)] {
+            hardware.caches.push(platform::Cache {
+                level,
+                bytes,
+                line_bytes: 64,
+                cpus: vec![0, 1],
+            });
+        }
+        let options = cli::Options {
+            threads: Some(2),
+            ..Default::default()
+        };
+        let (spec, cpus) = crate::resolve(&options, &hardware).unwrap();
+        let mut plans = cache::plans(&hardware, &cpus, "all").unwrap();
+        plans.reverse();
+        let model = rows(&options, &spec, &cpus, &plans, &hardware, false);
+        assert_eq!(
+            model.iter().map(|row| row.level).collect::<Vec<_>>(),
+            [0, 1, 2, 3]
+        );
+        assert_eq!(
+            model.iter().map(|row| row.available).collect::<Vec<_>>(),
+            [true, true, true, false]
+        );
+        assert_eq!(model.row_data(3).unwrap().label, "L3 Cache");
+        assert!(
+            model
+                .row_data(3)
+                .unwrap()
+                .cells
+                .iter()
+                .all(|cell| cell.value.is_empty())
+        );
+        assert!(
+            !Target {
+                level: 3,
+                column: None
+            }
+            .available(&model)
+        );
+        assert!(
+            Target {
+                level: 2,
+                column: Some(0)
+            }
+            .available(&model)
+        );
+        score(&model, 3, "Read", 123456.0, Some(1.0));
+        assert!(!has_results(&model));
+        assert!(unavailable_reason(3, &hardware, false).contains("not reported"));
+        let apple = unavailable_reason(3, &hardware, true);
+        assert!(apple.contains("macOS did not report CPU L3"));
+        assert!(apple.contains("SLC is not currently measured"));
+
+        hardware.caches.push(platform::Cache {
+            level: 3,
+            bytes: 64 << 10,
+            line_bytes: 0,
+            cpus: vec![0, 1],
+        });
+        assert!(unavailable_reason(3, &hardware, false).contains("incomplete"));
+        hardware.caches.last_mut().unwrap().line_bytes = 64;
+        let plans = cache::plans(&hardware, &cpus, "all").unwrap();
+        assert!(plans.iter().all(|plan| plan.level != 3));
+        let model = rows(&options, &spec, &cpus, &plans, &hardware, true);
+        let unavailable = model.row_data(3).unwrap();
+        assert!(!unavailable.available);
+        assert!(unavailable.context.contains("geometry is reported"));
+        assert!(
+            unavailable
+                .context
+                .contains("isolated test working set is unavailable")
+        );
+    }
+
+    #[test]
+    fn targeted_availability_changes_clear_stale_scores_and_preserve_other_rows() {
+        let model: slint::ModelRc<ResultRow> = Rc::new(slint::VecModel::from(vec![
+            row(0, "RAM".into(), "copy".into(), "latency".into()),
+            row(2, "old".into(), "old copy".into(), "old latency".into()),
+            row(3, "old L3".into(), "old copy".into(), "old latency".into()),
+        ]))
+        .into();
+        score(&model, 0, "Read", 60000.0, Some(1.0));
+        for label in ["Read", "Write", "Copy", "Latency"] {
+            score(&model, 2, label, 1000.0, Some(2.0));
+        }
+        score(&model, 3, "Read", 2000.0, Some(1.0));
+        let cache_cells = model.row_data(1).unwrap().cells;
+        let cells = cache_cells
+            .as_any()
+            .downcast_ref::<slint::VecModel<Cell>>()
+            .unwrap();
+        let mut cell = cells.row_data(0).unwrap();
+        cell.notes = "stale note".into();
+        cells.set_row_data(0, cell);
+        let untouched = model.row_data(0).unwrap().cells.iter().collect::<Vec<_>>();
+        let target = Target {
+            level: 2,
+            column: Some(0),
+        };
+        let model = refresh_rows(
+            model,
+            Rc::new(slint::VecModel::from(vec![
+                row(0, "fresh RAM".into(), "copy".into(), "latency".into()),
+                unavailable_row(2, &hardware()),
+                unavailable_row(3, &hardware()),
+            ]))
+            .into(),
+            Some(target),
+        );
+        assert!(!target.available(&model));
+        assert!(!model.row_data(2).unwrap().available);
+        assert!(
+            model
+                .row_data(2)
+                .unwrap()
+                .cells
+                .iter()
+                .all(|cell| cell.value.is_empty())
+        );
+        assert!(
+            model
+                .row_data(1)
+                .unwrap()
+                .cells
+                .iter()
+                .all(|cell| cell.value.is_empty() && cell.notes.is_empty())
+        );
+        assert!(has_results(&model));
+        assert!(memory_notes(&model).is_empty());
+        let model = refresh_rows(
+            model,
+            Rc::new(slint::VecModel::from(vec![
+                row(2, "new".into(), "copy".into(), "latency".into()),
+                row(3, "new L3".into(), "copy".into(), "latency".into()),
+            ]))
+            .into(),
+            Some(target),
+        );
+        assert!(target.available(&model));
+        assert!(model.row_data(2).unwrap().available);
+        assert!(
+            model
+                .row_data(2)
+                .unwrap()
+                .cells
+                .iter()
+                .all(|cell| cell.value.is_empty())
+        );
+        assert!(
+            model
+                .row_data(1)
+                .unwrap()
+                .cells
+                .iter()
+                .all(|cell| cell.value.is_empty())
+        );
+        score(&model, 2, "Read", 500000.0, Some(3.0));
+        assert_eq!(
+            model.row_data(1).unwrap().cells.row_data(0).unwrap().value,
+            "500.0"
+        );
+        assert_eq!(
+            model.row_data(0).unwrap().cells.iter().collect::<Vec<_>>(),
+            untouched
+        );
+    }
+
+    #[test]
     fn memory_notes_follow_selected_cells_and_read_uses_cached_loads() {
         let hardware = hardware();
         let options = cli::Options {
@@ -1241,10 +1466,10 @@ mod tests {
         let model = rows(&options, &spec, &[0, 1], &plans, &hardware(), true);
         assert!(model.row_data(0).unwrap().context.contains("2 workers"));
         assert!(!model.row_data(0).unwrap().context.contains("up to"));
-        assert_eq!(model.row_count(), 2);
+        assert_eq!(model.row_count(), 4);
         score(&model, 2, "Read", 512000.0, Some(2.5));
         let memory = model.row_data(0).unwrap();
-        let cache = model.row_data(1).unwrap();
+        let cache = model.row_data(2).unwrap();
         assert_eq!(memory.cells.row_data(0).unwrap().value, "");
         assert_eq!(cache.cells.row_data(0).unwrap().value, "512.0");
         assert!(cache.cells.row_data(0).unwrap().info.contains("2.5%"));
@@ -1285,16 +1510,16 @@ mod tests {
             rows(&selected, &spec, &[0, 1], &plans, &hardware(), true),
             Some(target),
         );
-        assert_eq!(model.row_count(), 2);
+        assert_eq!(model.row_count(), 4);
         assert_eq!(
-            model.row_data(1).unwrap().context,
+            model.row_data(2).unwrap().context,
             "Hover a result for its tested settings."
         );
         assert_eq!(
             model.row_data(0).unwrap().cells.row_data(1).unwrap(),
             untouched
         );
-        let cleared = model.row_data(1).unwrap().cells.row_data(0).unwrap();
+        let cleared = model.row_data(2).unwrap().cells.row_data(0).unwrap();
         assert!(cleared.value.is_empty());
         assert!(!cleared.info.contains("sample range"));
         score(&model, 2, "Read", 600000.0, Some(1.5));
@@ -1303,7 +1528,7 @@ mod tests {
             model.row_data(0).unwrap().cells.row_data(1).unwrap().value,
             "90000"
         );
-        let refreshed = model.row_data(1).unwrap().cells.row_data(0).unwrap();
+        let refreshed = model.row_data(2).unwrap().cells.row_data(0).unwrap();
         assert_eq!(refreshed.value, "600.0");
         assert_eq!(refreshed.info.matches("Median result;").count(), 1);
         assert!(refreshed.info.contains("1.5%"));
