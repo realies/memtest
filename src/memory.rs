@@ -1,15 +1,31 @@
 //! RAM sizing diagnostics against reported caches, not proof of RAM isolation.
 use crate::{platform::Hardware, profile::Spec};
 
+fn geometry(stride: usize, line: usize) -> bool {
+    (8..=128).contains(&line) && line.is_power_of_two() && stride >= 8 && stride.is_power_of_two()
+}
+
+/// Allocate enough span to touch four times the reported cache, retaining the
+/// 256 MiB span floor. The caller still applies the available-memory budget.
+/// Unknown line geometry retains the previous span-based sizing heuristic.
+pub fn automatic_latency_span(hardware: &Hardware, stride: usize) -> usize {
+    let target = hardware.cache_bytes.saturating_mul(4);
+    let span = if geometry(stride, hardware.cache_line_bytes) && stride > hardware.cache_line_bytes
+    {
+        target
+            .div_ceil(hardware.cache_line_bytes)
+            .saturating_mul(stride)
+    } else {
+        target
+    };
+    (256 << 20).max(span)
+}
+
 /// Estimate whole cache lines touched by the pointer chain, including partial
 /// final lines. The allocation is aligned to 128 bytes; larger or invalid line
 /// sizes cannot be estimated reliably. Arithmetic overflow also returns None.
 pub fn latency_footprint(spec: &Spec, cache_line_bytes: usize) -> Option<usize> {
-    if !(8..=128).contains(&cache_line_bytes)
-        || !cache_line_bytes.is_power_of_two()
-        || spec.stride < 8
-        || !spec.stride.is_power_of_two()
-    {
+    if !geometry(spec.stride, cache_line_bytes) {
         return None;
     }
     let nodes = spec.latency_bytes.checked_div(spec.stride)?;
@@ -20,6 +36,16 @@ pub fn latency_footprint(spec: &Spec, cache_line_bytes: usize) -> Option<usize> 
             .checked_mul(cache_line_bytes)
     } else {
         nodes.checked_mul(cache_line_bytes)
+    }
+}
+
+fn size(bytes: usize) -> String {
+    if bytes >= 1 << 20 {
+        format!("{:.1} MiB", bytes as f64 / (1 << 20) as f64)
+    } else if bytes >= 1024 && bytes.is_multiple_of(1024) {
+        format!("{} KiB", bytes / 1024)
+    } else {
+        format!("{bytes} B")
     }
 }
 
@@ -51,9 +77,9 @@ fn warnings_for(
             );
         } else if (spec.bandwidth_bytes as u128) < 4 * hardware.cache_total_bytes as u128 {
             result.push(format!(
-                "RAM bandwidth: {:.1} MiB per stream is below 4× reported aggregate cache ({:.1} MiB); cache may influence the result.",
-                spec.bandwidth_bytes as f64 / (1 << 20) as f64,
-                hardware.cache_total_bytes as f64 / (1 << 20) as f64,
+                "RAM bandwidth: {} per stream is below 4× reported aggregate cache ({}); cache may influence the result.",
+                size(spec.bandwidth_bytes),
+                size(hardware.cache_total_bytes),
             ));
         }
     }
@@ -62,9 +88,9 @@ fn warnings_for(
             Some(bytes) if hardware.cache_bytes != 0 => {
                 if (bytes as u128) < 4 * hardware.cache_bytes as u128 {
                     result.push(format!(
-                        "RAM latency: estimated touched cache footprint {:.1} MiB is below 4× the largest reported cache ({:.1} MiB); cache may influence the result.",
-                        bytes as f64 / (1 << 20) as f64,
-                        hardware.cache_bytes as f64 / (1 << 20) as f64,
+                        "RAM latency: estimated touched cache footprint {} is below 4× the largest reported cache ({}); cache may influence the result.",
+                        size(bytes),
+                        size(hardware.cache_bytes),
                     ));
                 }
             }
@@ -153,6 +179,22 @@ mod tests {
             spec.latency_bytes = span;
             assert_eq!(latency_footprint(&spec, line), Some(expected));
         }
+    }
+
+    #[test]
+    fn small_footprints_keep_exact_units_and_auto_span_saturates() {
+        let hardware = hardware();
+        let mut spec = spec();
+        spec.latency_bytes = 32 << 10;
+        let warnings = warnings_for(&hardware, &spec, false, true, false);
+        assert!(warnings[0].contains("16 KiB"));
+        spec.latency_bytes = 8;
+        spec.stride = 8;
+        assert!(warnings_for(&hardware, &spec, false, true, false)[0].contains("64 B"));
+        assert_eq!(size(1032), "1032 B");
+        let mut large = hardware;
+        large.cache_bytes = usize::MAX;
+        assert_eq!(automatic_latency_span(&large, 128), usize::MAX);
     }
 
     #[test]

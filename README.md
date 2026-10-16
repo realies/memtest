@@ -72,14 +72,15 @@ larger than the relevant caches in either mode.
 `--stores cached` selects ordinary stores. Rates count useful bytes, excluding extra
 bus traffic such as write allocation; Copy counts both reads and writes. Workers use
 private buffers, initialized after CPU placement, with synchronized timing that
-includes store completion.
+includes the kernels' store barriers.
 
 RAM latency follows a seeded pointer chain with 128-byte spacing. The default
 shuffles 2 MiB blocks and their nodes. `--window-kib 0` shuffles the whole buffer.
 Page-local, block-local and full-random access measure different locality and translation costs.
 Every sample traverses complete pointer cycles.
 The touched cache-line footprint can be smaller than the allocated span when
-pointer spacing exceeds the cache-line size; JSON reports it separately.
+pointer spacing exceeds the cache-line size; automatic latency sizing accounts
+for this when the line size is known, and JSON reports the footprint separately.
 
 Cache bandwidth uses cached stores and private worker buffers, bounded
 by half each shared cache's capacity and sized above lower caches. Cache latency uses

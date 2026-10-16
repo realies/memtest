@@ -166,10 +166,11 @@ def main():
         raise
     finally:
         manifest["finished_utc"] = datetime.now(timezone.utc).isoformat()
+        manifest["complete"] = sum("result" in record for record in manifest["records"]) == 2 * len(cases)
         write_json(output / "manifest.json", manifest)
         report = summary(manifest["records"])
-        if "error" in manifest:
-            report += "\nSweep incomplete; see manifest.json for the error.\n"
+        if not manifest["complete"]:
+            report += "\nSweep incomplete; see manifest.json for completed runs and any error.\n"
         (output / "summary.md").write_text(report, encoding="utf-8")
         if os.environ.get("GITHUB_STEP_SUMMARY"):
             with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as destination:

@@ -171,7 +171,7 @@ fn resolve(
             if options.quick {
                 16 << 20
             } else {
-                (256 << 20).max(hardware.cache_bytes.saturating_mul(4))
+                memory::automatic_latency_span(hardware, stride)
             },
             stride,
             memory && (options.test == "all" || options.test == "latency"),
@@ -746,6 +746,106 @@ mod tests {
         assert!(resolve(&options("--test read --size-mib 64"), &hardware).is_ok());
         assert!(resolve(&options("--test latency --latency-size-mib 16"), &hardware).is_ok());
     }
+
+    #[test]
+    fn automatic_latency_span_accounts_for_touched_cache_lines() {
+        let mut hardware = hardware();
+        hardware.cache_bytes = 96 << 20;
+        hardware.memory_budget = 8usize << 30;
+        for (line, stride, span_mib) in [
+            (64, 128, 768),
+            (128, 128, 384),
+            (64, 512, 3072),
+            (64, 64, 384),
+        ] {
+            hardware.cache_line_bytes = line;
+            let settings = options(&format!("--test latency --level memory --stride {stride}"));
+            let (spec, _) = resolve(&settings, &hardware).unwrap();
+            assert_eq!(spec.latency_bytes, span_mib << 20);
+            assert_eq!(
+                memory::latency_footprint(&spec, line),
+                Some(4 * hardware.cache_bytes)
+            );
+            assert!(
+                !memory::warnings(&hardware, &spec, false, true)
+                    .iter()
+                    .any(|warning| warning.starts_with("RAM latency:"))
+            );
+        }
+    }
+
+    #[test]
+    fn automatic_latency_span_keeps_floor_budget_and_unknown_geometry() {
+        let mut hardware = hardware();
+        hardware.cache_bytes = 16 << 20;
+        let settings = options("--test latency --level memory");
+        assert_eq!(
+            resolve(&settings, &hardware).unwrap().0.latency_bytes,
+            256 << 20
+        );
+        hardware.cache_bytes = 96 << 20;
+        hardware.memory_budget = 512 << 20;
+        let (limited, _) = resolve(&settings, &hardware).unwrap();
+        assert_eq!(limited.latency_bytes, hardware.memory_budget);
+        assert!(
+            memory::warnings(&hardware, &limited, false, true)
+                .iter()
+                .any(|warning| warning.starts_with("RAM latency:"))
+        );
+        assert_eq!(
+            resolve(&options("--quick"), &hardware)
+                .unwrap()
+                .0
+                .latency_bytes,
+            16 << 20
+        );
+        for line in [0, 256] {
+            hardware.cache_line_bytes = line;
+            let (unknown, _) = resolve(&settings, &hardware).unwrap();
+            assert_eq!(unknown.latency_bytes, 384 << 20);
+            assert!(
+                memory::warnings(&hardware, &unknown, false, true)
+                    .iter()
+                    .any(|warning| warning.contains("unknown"))
+            );
+        }
+        hardware.cache_line_bytes = 64;
+        hardware.cache_bytes = usize::MAX;
+        assert_eq!(
+            resolve(&settings, &hardware).unwrap().0.latency_bytes,
+            hardware.memory_budget
+        );
+    }
+
+    #[test]
+    fn explicit_and_profile_latency_spans_keep_their_fixed_settings() {
+        let mut hardware = hardware();
+        hardware.cache_bytes = 96 << 20;
+        let (saved, _) = resolve(
+            &options("--test latency --level memory --latency-size-mib 384 --threads 2"),
+            &hardware,
+        )
+        .unwrap();
+        assert_eq!(saved.latency_bytes, 384 << 20);
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "memtest-latency-size-profile-{}-{stamp}.profile",
+            std::process::id()
+        ));
+        saved.save(&path).unwrap();
+        let mut settings = options("--test latency --level memory");
+        settings.profile = Some(path.clone());
+        let replayed = resolve(&settings, &hardware);
+        settings.latency_size = Some(0);
+        let automatic = resolve(&settings, &hardware);
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(replayed.unwrap().0, saved);
+        assert_eq!(automatic.unwrap().0.latency_bytes, 768 << 20);
+    }
+
     #[test]
     fn latency_uses_one_cpu_without_rewriting_bandwidth_settings() {
         let (spec, cpus) = resolve(&options("--test latency --threads 8"), &hardware()).unwrap();
