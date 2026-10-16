@@ -162,6 +162,8 @@ fn initial_choice(value: Option<usize>) -> Option<String> {
 }
 
 fn preview(window: &MemtestWindow, base: &cli::Options, hardware: &platform::Hardware) {
+    window.set_memory_warning("".into());
+    window.set_details("".into());
     let resolved = settings(window, base)
         .and_then(|options| crate::resolve(&options, hardware).map(|resolved| (options, resolved)));
     {
@@ -258,7 +260,10 @@ fn preview(window: &MemtestWindow, base: &cli::Options, hardware: &platform::Har
                     return;
                 }
             };
-            window.set_rows(rows(&options, &spec, &cpus, &plans, false));
+            replace_rows(
+                window,
+                rows(&options, &spec, &cpus, &plans, hardware, false),
+            );
             window.set_details(
                 details(
                     &spec,
@@ -280,7 +285,10 @@ fn preview(window: &MemtestWindow, base: &cli::Options, hardware: &platform::Har
 }
 
 fn clear(window: &MemtestWindow) {
-    window.set_rows(Rc::new(slint::VecModel::from(Vec::<ResultRow>::new())).into());
+    replace_rows(
+        window,
+        Rc::new(slint::VecModel::from(Vec::<ResultRow>::new())).into(),
+    );
     window.set_has_results(false);
     window.set_active_level(-1);
     window.set_active_column(-1);
@@ -426,6 +434,25 @@ fn has_results(model: &slint::ModelRc<ResultRow>) -> bool {
         .any(|row| row.cells.iter().any(|cell| !cell.value.is_empty()))
 }
 
+fn memory_notes(model: &slint::ModelRc<ResultRow>) -> String {
+    let mut notes = Vec::new();
+    for row in model.iter() {
+        for cell in row.cells.iter() {
+            for note in cell.notes.lines() {
+                if !notes.iter().any(|seen| seen == note) {
+                    notes.push(note.to_owned());
+                }
+            }
+        }
+    }
+    notes.join("\n")
+}
+
+fn replace_rows(window: &MemtestWindow, model: slint::ModelRc<ResultRow>) {
+    window.set_memory_warning(memory_notes(&model).into());
+    window.set_rows(model);
+}
+
 fn update_has_results(window: &MemtestWindow) {
     window.set_has_results(has_results(&window.get_rows()));
 }
@@ -457,6 +484,7 @@ fn row(level: u8, context: String, copy_context: String, latency_context: String
     .map(|info| Cell {
         value: "".into(),
         info: info.into(),
+        notes: "".into(),
     })
     .collect::<Vec<_>>();
     ResultRow {
@@ -472,6 +500,7 @@ fn rows(
     spec: &profile::Spec,
     cpus: &[usize],
     plans: &[cache::Plan],
+    hardware: &platform::Hardware,
     resolved: bool,
 ) -> slint::ModelRc<ResultRow> {
     let mut rows = Vec::new();
@@ -544,6 +573,23 @@ fn rows(
             .downcast_ref::<slint::VecModel<Cell>>()
             .unwrap();
         for (index, mut cell) in cells.iter().enumerate() {
+            if row.level == 0 {
+                if index == 0 {
+                    cell.info = format!(
+                        "{} total read working set · {}. Cached loads; decimal MB/s.",
+                        bytes_text(spec.bandwidth_bytes),
+                        workers_text(cpus.len(), !resolved && crate::calibrates_workers(options)),
+                    )
+                    .into();
+                }
+                if options.test == "all"
+                    || options.test == ["read", "write", "copy", "latency"][index]
+                {
+                    cell.notes = crate::memory::warnings(hardware, spec, index < 3, index == 3)
+                        .join("\n")
+                        .into();
+                }
+            }
             cell.info = format!("{}\n{method}", cell.info).into();
             cells.set_row_data(index, cell);
         }
@@ -807,11 +853,14 @@ pub fn run(options: cli::Options) -> Result<(), String> {
         window.set_has_results(false);
         window.set_progress(0.0);
         window.set_elapsed("".into());
-        window.set_rows(refresh_rows(
-            window.get_rows(),
-            rows(&options, &spec, &cpus, &plans, false),
-            target,
-        ));
+        replace_rows(
+            &window,
+            refresh_rows(
+                window.get_rows(),
+                rows(&options, &spec, &cpus, &plans, &hardware, false),
+                target,
+            ),
+        );
         window.set_busy(true);
         window.set_error(false);
         window.set_status("Preparing…".into());
@@ -820,6 +869,7 @@ pub fn run(options: cli::Options) -> Result<(), String> {
         let memory = matches!(options.level.as_str(), "all" | "memory");
         let tests = if options.test == "all" { 4 } else { 1 };
         let mut total = (usize::from(memory) + plans.len()) * tests;
+        let starting_hardware = hardware.clone();
         match std::thread::Builder::new()
             .name("memtest-measure".into())
             .spawn(move || {
@@ -829,7 +879,7 @@ pub fn run(options: cli::Options) -> Result<(), String> {
                 // Debug builds unwind; release builds intentionally abort on panic.
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     crate::measure(&options, |progress| {
-                        if let Progress::Plan(plans, _, _) = &progress {
+                        if let Progress::Plan(plans, _, _, _) = &progress {
                             total = (usize::from(memory) + plans.len()) * tests;
                         }
                         if matches!(progress, Progress::Result(..)) {
@@ -837,12 +887,15 @@ pub fn run(options: cli::Options) -> Result<(), String> {
                         }
                         let row_options = row_options.clone();
                         let _ = updates.upgrade_in_event_loop(move |window| match progress {
-                            Progress::Plan(plans, spec, cpus) => {
-                                window.set_rows(refresh_rows(
-                                    window.get_rows(),
-                                    rows(&row_options, &spec, &cpus, &plans, true),
-                                    target,
-                                ));
+                            Progress::Plan(plans, spec, cpus, hardware) => {
+                                replace_rows(
+                                    &window,
+                                    refresh_rows(
+                                        window.get_rows(),
+                                        rows(&row_options, &spec, &cpus, &plans, &hardware, true),
+                                        target,
+                                    ),
+                                );
                                 window.set_details(
                                     details(
                                         &spec,
@@ -898,11 +951,21 @@ pub fn run(options: cli::Options) -> Result<(), String> {
                                 .iter()
                                 .map(|cache| cache.plan.clone())
                                 .collect();
-                            window.set_rows(refresh_rows(
-                                window.get_rows(),
-                                rows(&options, &report.spec, &report.cpus, &plans, true),
-                                target,
-                            ));
+                            replace_rows(
+                                &window,
+                                refresh_rows(
+                                    window.get_rows(),
+                                    rows(
+                                        &options,
+                                        &report.spec,
+                                        &report.cpus,
+                                        &plans,
+                                        &report.hardware,
+                                        true,
+                                    ),
+                                    target,
+                                ),
+                            );
                             for (label, value) in [
                                 ("Read", report.results.read),
                                 ("Write", report.results.write),
@@ -956,11 +1019,14 @@ pub fn run(options: cli::Options) -> Result<(), String> {
                         }
                         Err(error) => {
                             // A live sample is not a completed result.
-                            window.set_rows(refresh_rows(
-                                window.get_rows(),
-                                rows(&options, &spec, &cpus, &plans, false),
-                                target,
-                            ));
+                            replace_rows(
+                                &window,
+                                refresh_rows(
+                                    window.get_rows(),
+                                    rows(&options, &spec, &cpus, &plans, &starting_hardware, false),
+                                    target,
+                                ),
+                            );
                             update_has_results(&window);
                             window.set_status(error.into());
                             window.set_error(true);
@@ -1022,6 +1088,121 @@ pub fn run(options: cli::Options) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn hardware() -> platform::Hardware {
+        platform::Hardware {
+            cpus: vec![0, 1],
+            preferred: vec![0, 1],
+            caches: Vec::new(),
+            cache_bytes: 32 << 20,
+            cache_total_bytes: 64 << 20,
+            cache_line_bytes: 64,
+            memory_budget: 1 << 30,
+            affinity: "hard",
+            page_size: 4096,
+        }
+    }
+
+    #[test]
+    fn memory_notes_follow_selected_cells_and_read_uses_cached_loads() {
+        let hardware = hardware();
+        let options = cli::Options {
+            test: "read".into(),
+            threads: Some(2),
+            size: Some(64 << 20),
+            latency_size: Some(64 << 20),
+            ..Default::default()
+        };
+        let (spec, cpus) = crate::resolve(&options, &hardware).unwrap();
+        let model = rows(&options, &spec, &cpus, &[], &hardware, false);
+        let cells = model.row_data(0).unwrap().cells;
+        let read = cells.row_data(0).unwrap();
+        assert!(read.info.contains("Cached loads"));
+        assert!(!read.info.contains("streaming"));
+        assert!(read.notes.contains("RAM bandwidth:"));
+        assert!((1..4).all(|column| cells.row_data(column).unwrap().notes.is_empty()));
+        assert!(!memory_notes(&model).contains("RAM latency:"));
+
+        let options = cli::Options {
+            test: "all".into(),
+            ..options
+        };
+        let model = rows(&options, &spec, &cpus, &[], &hardware, false);
+        let notes = memory_notes(&model);
+        assert_eq!(notes.matches("RAM bandwidth:").count(), 1);
+        assert_eq!(notes.matches("RAM latency:").count(), 1);
+    }
+
+    #[test]
+    fn notes_survive_targeted_refresh_and_clear_with_the_model() {
+        let memory = row(0, "RAM".into(), "copy".into(), "latency".into());
+        let cells = memory
+            .cells
+            .as_any()
+            .downcast_ref::<slint::VecModel<Cell>>()
+            .unwrap();
+        for (column, notes) in [
+            "old read note",
+            "bandwidth note",
+            "bandwidth note",
+            "latency note",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut cell = cells.row_data(column).unwrap();
+            cell.notes = notes.into();
+            cells.set_row_data(column, cell);
+        }
+        let model: slint::ModelRc<ResultRow> = Rc::new(slint::VecModel::from(vec![
+            memory,
+            row(2, "cache".into(), "copy".into(), "latency".into()),
+        ]))
+        .into();
+        let before = memory_notes(&model);
+        let cache = Rc::new(slint::VecModel::from(vec![row(
+            2,
+            "new cache".into(),
+            "copy".into(),
+            "latency".into(),
+        )]))
+        .into();
+        let model = refresh_rows(
+            model,
+            cache,
+            Some(Target {
+                level: 2,
+                column: Some(0),
+            }),
+        );
+        assert_eq!(memory_notes(&model), before);
+
+        let fresh = row(0, "new RAM".into(), "copy".into(), "latency".into());
+        let cells = fresh
+            .cells
+            .as_any()
+            .downcast_ref::<slint::VecModel<Cell>>()
+            .unwrap();
+        let mut read = cells.row_data(0).unwrap();
+        read.notes = "new read note".into();
+        cells.set_row_data(0, read);
+        let model = refresh_rows(
+            model,
+            Rc::new(slint::VecModel::from(vec![fresh])).into(),
+            Some(Target {
+                level: 0,
+                column: Some(0),
+            }),
+        );
+        let notes = memory_notes(&model);
+        assert!(!notes.contains("old read note"));
+        assert!(notes.contains("new read note") && notes.contains("latency note"));
+        assert_eq!(notes.matches("bandwidth note").count(), 1);
+
+        let empty = Rc::new(slint::VecModel::from(Vec::<ResultRow>::new())).into();
+        assert!(memory_notes(&refresh_rows(model, empty, None)).is_empty());
+    }
+
     #[test]
     fn result_units_and_row_updates_remain_isolated_and_reset() {
         assert_eq!(value_text(0, "Read", 56000.0), "56000");
@@ -1049,7 +1230,7 @@ mod tests {
             stride: 64,
             cpu: 0,
         }];
-        let preview = rows(&options, &spec, &[0, 1], &plans, false);
+        let preview = rows(&options, &spec, &[0, 1], &plans, &hardware(), false);
         assert!(
             preview
                 .row_data(0)
@@ -1057,7 +1238,7 @@ mod tests {
                 .context
                 .contains("up to 2 workers")
         );
-        let model = rows(&options, &spec, &[0, 1], &plans, true);
+        let model = rows(&options, &spec, &[0, 1], &plans, &hardware(), true);
         assert!(model.row_data(0).unwrap().context.contains("2 workers"));
         assert!(!model.row_data(0).unwrap().context.contains("up to"));
         assert_eq!(model.row_count(), 2);
@@ -1076,7 +1257,7 @@ mod tests {
                 .info
                 .contains("combined bytes read + written")
         );
-        let reset = rows(&options, &spec, &[0, 1], &plans, true);
+        let reset = rows(&options, &spec, &[0, 1], &plans, &hardware(), true);
         assert!(reset.iter().all(|row| {
             row.cells
                 .iter()
@@ -1088,7 +1269,10 @@ mod tests {
         };
         assert_eq!(displayed_workers(&selected, &[0, 1, 2, 3], &plans), 2);
         assert!(details(&spec, 2, false, "l2").contains("cache-line stride"));
-        assert_eq!(rows(&selected, &spec, &[0, 1], &plans, true).row_count(), 1);
+        assert_eq!(
+            rows(&selected, &spec, &[0, 1], &plans, &hardware(), true).row_count(),
+            1
+        );
 
         score(&model, 0, "Write", 90000.0, Some(1.0));
         let untouched = model.row_data(0).unwrap().cells.row_data(1).unwrap();
@@ -1098,7 +1282,7 @@ mod tests {
         };
         let model = refresh_rows(
             model,
-            rows(&selected, &spec, &[0, 1], &plans, true),
+            rows(&selected, &spec, &[0, 1], &plans, &hardware(), true),
             Some(target),
         );
         assert_eq!(model.row_count(), 2);

@@ -99,6 +99,20 @@ pub fn render(
             .unwrap_or_else(|| "null".into())
     };
     let mut cache_rows = Vec::new();
+    let warnings = crate::memory::warnings(
+        hardware,
+        spec,
+        results.read.is_some() || results.write.is_some() || results.copy.is_some(),
+        results.latency.is_some(),
+    )
+    .iter()
+    .map(|message| quoted(message))
+    .collect::<Vec<_>>()
+    .join(", ");
+    let latency_footprint = results
+        .latency
+        .and_then(|_| crate::memory::latency_footprint(spec, hardware.cache_line_bytes))
+        .map_or_else(|| "null".into(), |bytes| bytes.to_string());
     for row in caches {
         let p = &row.plan;
         let cpu = if scheduled {
@@ -131,6 +145,10 @@ pub fn render(
   "worker_selection": {},
   "page_bytes": {},
   "cache_line_bytes": {},
+  "reported_cache_bytes": {},
+  "reported_cache_total_bytes": {},
+  "latency_cache_footprint_bytes": {},
+  "warnings": [{}],
   "copy_convention": "read_plus_write_bytes",
   "memory_copy_buffers": 2,
   "config": {{
@@ -161,6 +179,10 @@ pub fn render(
         quoted(worker_selection),
         hardware.page_size,
         hardware.cache_line_bytes,
+        hardware.cache_bytes,
+        hardware.cache_total_bytes,
+        latency_footprint,
+        warnings,
         spec.threads,
         spec.cache_threads,
         quoted(spec.stores.key()),
@@ -286,6 +308,46 @@ mod tests {
         assert!(scheduled.contains("\"affinity\": \"os_scheduled\""));
         assert!(scheduled.contains("\"cpu_ids\": null"));
         assert!(scheduled.contains("\"cpu_id\": null"));
+    }
+    #[test]
+    fn memory_notes_follow_measured_tests_and_preserve_footprints() {
+        let (spec, mut hardware) = fixture();
+        hardware.cache_bytes = 4096;
+        hardware.cache_total_bytes = 8192;
+        let results = Results {
+            latency: Some(Measurement {
+                value: 10.0,
+                spread_percent: 1.0,
+            }),
+            ..Results::default()
+        };
+        let text = render(
+            &spec,
+            &hardware,
+            &[2],
+            "fixed",
+            Backend::Sse2,
+            &results,
+            &[],
+        )
+        .unwrap();
+        assert!(text.contains("\"reported_cache_bytes\": 4096"));
+        assert!(text.contains("\"reported_cache_total_bytes\": 8192"));
+        assert!(text.contains("\"latency_cache_footprint_bytes\": 2048"));
+        assert!(text.contains("RAM latency:"));
+        assert!(!text.contains("RAM bandwidth:"));
+        let empty = render(
+            &spec,
+            &hardware,
+            &[2],
+            "fixed",
+            Backend::Sse2,
+            &Results::default(),
+            &[],
+        )
+        .unwrap();
+        assert!(empty.contains("\"latency_cache_footprint_bytes\": null"));
+        assert!(empty.contains("\"warnings\": []"));
     }
     #[test]
     fn rejects_nonfinite_numbers() {

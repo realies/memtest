@@ -37,7 +37,10 @@ memtest --level memory --profile reference.profile
 Without flags, buffer sizes follow cache size and memory limits. Short pilot
 runs select a worker count, then fresh samples measure performance. Explicit
 worker counts and profiles skip selection. `--quick` is a short check; its small
-RAM buffers may fit in cache. Use `--help` for all options.
+RAM buffers may fit in cache. Buffer notes appear under Status in the GUI, in CLI
+output, and in JSON's `warnings`. They use a conservative 4× reported-cache
+reference and cannot certify RAM isolation. Apple's SLC is not reported,
+so its coverage remains unknown. Use `--help` for all options.
 
 Profiles save resolved RAM settings, store policy, and cache worker limits as plain
 text; cache sizes follow each host.
@@ -63,7 +66,9 @@ Downloads include dependency notices generated for their target platform.
 ## Method
 
 RAM reads use cached loads. Writes and copies default to non-temporal stores on
-x86 and `STNP` hints on ARM; ARM hardware may handle the hint differently.
+x86 and `STNP` hints on ARM; the ARM hint may be ignored. Streaming is a write
+strategy, not a guarantee of cache bypass. RAM tests need working sets substantially
+larger than the relevant caches in either mode.
 `--stores cached` selects ordinary stores. Rates count useful bytes, excluding extra
 bus traffic such as write allocation; Copy counts both reads and writes. Workers use
 private buffers, initialized after CPU placement, with synchronized timing that
@@ -73,6 +78,8 @@ RAM latency follows a seeded pointer chain with 128-byte spacing. The default
 shuffles 2 MiB blocks and their nodes. `--window-kib 0` shuffles the whole buffer.
 Page-local, block-local and full-random access measure different locality and translation costs.
 Every sample traverses complete pointer cycles.
+The touched cache-line footprint can be smaller than the allocated span when
+pointer spacing exceeds the cache-line size; JSON reports it separately.
 
 Cache bandwidth uses cached stores and private worker buffers, bounded
 by half each shared cache's capacity and sized above lower caches. Cache latency uses
@@ -87,5 +94,9 @@ load. JSON includes settings, footprints, placement and ranges. CLI errors use s
 and a nonzero exit code. Fixed settings preserve the workload across hosts; scheduling,
 CPU placement, page policy and ISA still affect scores. Windows/Linux pin workers;
 macOS uses OS scheduling. Scores are not directly equivalent to AIDA64.
+
+`python3 scripts/memory-sweep.py <binary> <output-directory>` compares fixed-worker
+cached and streaming runs at increasing sizes, saving raw JSON and a summary.
+The same optional sweep is available when running CI manually.
 
 <a href="https://slint.dev"><img src="https://raw.githubusercontent.com/slint-ui/slint/v1.18.1/logo/MadeWithSlint-logo-whitebg.png" alt="Made with Slint" width="120"></a>

@@ -14,6 +14,10 @@ on:
       tag:
         description: Existing version tag to build when publishing manually
         type: string
+      memory_sweep:
+        description: Compare cached and streaming memory workloads with fixed workers
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -112,6 +116,20 @@ jobs:
           if ($result.schema -ne 3 -or $result.config.threads -ne 1 -or $result.results.read.mb_per_s -le 0 -or $result.results.copy.mb_per_s -le 0) {
             throw 'CLI-only JSON output is invalid'
           }
+      - name: Validate fixed-worker memory sizes and store policies
+        if: inputs.memory_sweep
+        run: |
+          $binary = if ($IsWindows) { "./cli-target/$env:BUILD_TARGET/release/memtest.exe" } else { "./cli-target/$env:BUILD_TARGET/release/memtest" }
+          $python = if ($IsWindows) { 'python' } else { 'python3' }
+          & $python scripts/memory-sweep.py $binary memory-sweep
+          if ($LASTEXITCODE -ne 0) { throw 'Memory sweep failed' }
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always() && inputs.memory_sweep
+        with:
+          name: memory-sweep-${{ matrix.target }}
+          path: memory-sweep/
+          if-no-files-found: error
+          retention-days: 14
       - name: Native smoke test
         run: |
           $binary = if ($IsWindows) { "./target/$env:BUILD_TARGET/release/memtest.exe" } else { "./target/$env:BUILD_TARGET/release/memtest" }

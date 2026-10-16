@@ -5,6 +5,7 @@ mod desktop;
 #[cfg(feature = "gui")]
 mod gui;
 mod json;
+mod memory;
 mod platform;
 mod portable;
 mod profile;
@@ -241,7 +242,7 @@ fn cache_plans(
 }
 
 pub(crate) enum Progress {
-    Plan(Vec<cache::Plan>, Spec, Vec<usize>),
+    Plan(Vec<cache::Plan>, Spec, Vec<usize>, Box<platform::Hardware>),
     Stage(&'static str),
     Test(u8, &'static str),
     Sample(u8, &'static str, usize, usize, f64),
@@ -282,11 +283,16 @@ pub(crate) fn measure(
     } else {
         "fixed"
     };
-    update(Progress::Plan(plans.clone(), spec.clone(), cpus.clone()));
+    let memory = matches!(options.level.as_str(), "all" | "memory");
+    update(Progress::Plan(
+        plans.clone(),
+        spec.clone(),
+        cpus.clone(),
+        Box::new(hardware.clone()),
+    ));
     if let Some(path) = &options.save_profile {
         spec.save(path)?;
     }
-    let memory = matches!(options.level.as_str(), "all" | "memory");
     let results = if memory {
         measure_row(options, backend, &cpus, cpus[0], &spec, 0, &mut update)?
     } else {
@@ -549,6 +555,14 @@ pub(crate) fn report_text(report: &Report) -> String {
         hardware.page_size / 1024
     )
     .unwrap();
+    for warning in memory::warnings(
+        hardware,
+        spec,
+        results.read.is_some() || results.write.is_some() || results.copy.is_some(),
+        results.latency.is_some(),
+    ) {
+        writeln!(text, "Note: {warning}").unwrap();
+    }
     text
 }
 
@@ -566,7 +580,7 @@ pub(crate) fn report_json(report: &Report) -> Result<String, String> {
 
 fn run(options: cli::Options) -> Result<(), String> {
     let report = measure(&options, |progress| match progress {
-        Progress::Plan(_plans, _spec, _cpus) => {}
+        Progress::Plan(_plans, _spec, _cpus, _hardware) => {}
         Progress::Stage(_stage) => {}
         Progress::Test(_level, _name) => {}
         Progress::Sample(_level, _name, _index, _count, _value) => {}
@@ -718,6 +732,7 @@ mod tests {
             let (spec, _) = resolve(&options(input), &hardware).unwrap();
             assert_eq!(spec.bandwidth_bytes, 4 << 20);
             assert_eq!(spec.latency_bytes, 8 << 20);
+            assert!(memory::warnings(&hardware, &spec, true, true).len() >= 2);
         }
         hardware.memory_budget = 0;
         assert!(resolve(&options("--quick"), &hardware).is_err());

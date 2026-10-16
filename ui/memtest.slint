@@ -114,6 +114,7 @@ component Readout inherits FieldFrame {
     in property <string> value;
     in property <string> unit;
     in property <string> info;
+    in property <string> notes;
     in property <string> label;
     in property <bool> enabled: true;
     callback activated;
@@ -159,7 +160,8 @@ component Readout inherits FieldFrame {
             HorizontalLayout {
                 padding: 6px;
                 Text {
-                    text: root.info + "\nDouble-click to run this test, or focus it and press Enter or Space.";
+                    text: root.info + (root.notes == "" ? "" : "\n\n" + root.notes)
+                        + "\nDouble-click to run this test, or focus it and press Enter or Space.";
                     color: Palette.text;
                     wrap: word-wrap;
                     max-width: 300px;
@@ -219,7 +221,7 @@ component InfoField inherits FieldFrame {
 }
 
 export struct Choice { label: string, value: string }
-export struct Cell { value: string, info: string }
+export struct Cell { value: string, info: string, notes: string }
 export struct ResultRow { level: int, label: string, context: string, cells: [Cell] }
 
 component Chevron inherits Path {
@@ -238,6 +240,7 @@ component Combo inherits FieldFrame {
     in property <[Choice]> model;
     in-out property <int> current-index: -1;
     in property <string> label;
+    in property <string> info;
     in property <bool> enabled: true;
     callback selected(index: int);
     private property <int> highlighted-index: -1;
@@ -329,7 +332,12 @@ component Combo inherits FieldFrame {
             border-color: Palette.field-border;
             HorizontalLayout {
                 padding: 6px;
-                Text { text: root.display-text; color: Palette.text; }
+                Text {
+                    text: root.info == "" ? root.display-text : root.info;
+                    color: Palette.text;
+                    wrap: word-wrap;
+                    max-width: 300px;
+                }
             }
         }
     }
@@ -656,6 +664,7 @@ export component MemtestWindow inherits Window {
     in-out property <string> status: "Ready";
     in property <string> elapsed;
     in property <string> details;
+    in property <string> memory-warning;
     in property <bool> has-results;
 
     // (-1, -1) runs the suite; (level, -1) a row; (level, 0..3) one cell.
@@ -839,6 +848,7 @@ export component MemtestWindow inherits Window {
                             width: root.result-w;
                             value: cell.value;
                             info: cell.info;
+                            notes: cell.notes;
                             unit: column == 3 ? "ns" : row.level == 0 ? "MB/s" : "GB/s";
                             label: row.label + " " + (column == 0 ? "Read" : column == 1 ? "Write" : column == 2 ? "Copy" : "Latency");
                             enabled: !root.busy;
@@ -959,6 +969,7 @@ export component MemtestWindow inherits Window {
                             Combo {
                                 width: root.col-w;
                                 label: "RAM store policy";
+                                info: "Cached uses ordinary writes. Streaming uses non-temporal stores (STNP hints on ARM); it does not guarantee cache bypass on every CPU. Affects RAM Write and the destination of Copy only.";
                                 model: root.store-options;
                                 current-index <=> root.store-index;
                                 enabled: !root.busy;
@@ -1086,7 +1097,7 @@ export component MemtestWindow inherits Window {
                                         HorizontalLayout {
                                             padding: 6px;
                                             Text {
-                                                text: "Run settings\n" + root.details;
+                                                text: "Run settings\n" + root.details + (root.memory-warning == "" ? "" : "\n\n" + root.memory-warning);
                                                 color: Palette.text;
                                                 wrap: word-wrap;
                                                 max-width: 300px;
@@ -1103,7 +1114,7 @@ export component MemtestWindow inherits Window {
                         running: root.busy;
                         done: !root.busy && !root.error && root.has-results;
                         error: root.error;
-                        text: root.status;
+                        text: root.status + (!root.busy && !root.error && root.memory-warning != "" ? " · see notes" : "");
                         detail: root.elapsed;
                     }
                 }
