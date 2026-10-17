@@ -1,4 +1,4 @@
-//! OS topology, conservative allocation budgets, and scoped thread affinity.
+//! OS topology, conservative allocation budgets, and scoped benchmark placement.
 #[cfg(any(windows, target_os = "linux", test))]
 use std::collections::BTreeMap;
 #[cfg(any(windows, target_os = "linux", test))]
@@ -149,6 +149,7 @@ mod native {
 #[cfg(target_os = "macos")]
 mod native {
     use std::ffi::c_void;
+    #[link(name = "System")]
     unsafe extern "C" {
         fn sysctlbyname(
             name: *const u8,
@@ -158,6 +159,19 @@ mod native {
             new_size: usize,
         ) -> i32;
         pub fn getpagesize() -> i32;
+        pub fn pthread_self() -> *mut c_void;
+        #[cfg(test)]
+        pub fn pthread_get_qos_class_np(
+            thread: *mut c_void,
+            class: *mut u32,
+            priority: *mut i32,
+        ) -> i32;
+        pub fn pthread_override_qos_class_start_np(
+            thread: *mut c_void,
+            class: u32,
+            priority: i32,
+        ) -> *mut c_void;
+        pub fn pthread_override_qos_class_end_np(token: *mut c_void) -> i32;
     }
     pub fn value(name: &[u8]) -> usize {
         let mut value = 0u64;
@@ -273,12 +287,46 @@ pub fn cpus() -> Vec<usize> {
     (0..std::thread::available_parallelism().map_or(1, usize::from)).collect()
 }
 
-/// Restores the calling thread's previous affinity when dropped.
+#[cfg(target_os = "macos")]
+struct BenchmarkQos(*mut std::ffi::c_void);
+
+#[cfg(target_os = "macos")]
+impl BenchmarkQos {
+    fn new() -> Result<Self, String> {
+        // Public API contracts and constants:
+        // github.com/apple-oss-distributions/libpthread/blob/main/include/pthread/qos.h
+        // github.com/apple-oss-distributions/libpthread/blob/main/include/sys/qos.h
+        let thread = unsafe { native::pthread_self() };
+        const USER_INITIATED: u32 = 0x19;
+        // A scoped floor preserves higher priorities and unspecified requested
+        // QoS, which cannot be restored with the public QoS setter.
+        let token =
+            unsafe { native::pthread_override_qos_class_start_np(thread, USER_INITIATED, 0) };
+        if token.is_null() {
+            return Err("cannot start macOS benchmark QoS override".into());
+        }
+        Ok(Self(token))
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for BenchmarkQos {
+    fn drop(&mut self) {
+        // The API consumes the token. Like affinity restoration, cleanup is
+        // best effort because Drop cannot return an OS error to the caller.
+        let _ = unsafe { native::pthread_override_qos_class_end_np(self.0) };
+    }
+}
+
+/// Restores affinity, or macOS benchmark QoS, on the same calling thread.
+/// macOS remains OS-scheduled; QoS never pins a core.
 pub struct Affinity {
     #[cfg(windows)]
     previous: native::GroupAffinity,
     #[cfg(target_os = "linux")]
     previous: Vec<usize>,
+    #[cfg(target_os = "macos")]
+    _qos: BenchmarkQos,
     // A guard must restore affinity on the same thread that created it.
     _thread: std::marker::PhantomData<*mut ()>,
 }
@@ -321,7 +369,15 @@ pub fn pin(cpu: usize) -> Result<Affinity, String> {
             _thread: std::marker::PhantomData,
         })
     }
-    #[cfg(not(any(windows, target_os = "linux")))]
+    #[cfg(target_os = "macos")]
+    {
+        let _ = cpu;
+        Ok(Affinity {
+            _qos: BenchmarkQos::new()?,
+            _thread: std::marker::PhantomData,
+        })
+    }
+    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
     {
         let _ = cpu;
         Ok(Affinity {
@@ -1213,6 +1269,23 @@ mod tests {
     #[test]
     fn affinity_round_trip() {
         let before = cpus();
+        #[cfg(target_os = "macos")]
+        let requested_qos = || {
+            let (mut class, mut priority) = (0, 0);
+            assert_eq!(
+                unsafe {
+                    native::pthread_get_qos_class_np(
+                        native::pthread_self(),
+                        &mut class,
+                        &mut priority,
+                    )
+                },
+                0
+            );
+            (class, priority)
+        };
+        #[cfg(target_os = "macos")]
+        let saved_qos = requested_qos();
         #[cfg(windows)]
         let mut saved = native::GroupAffinity::default();
         #[cfg(windows)]
@@ -1222,6 +1295,16 @@ mod tests {
         );
         {
             let _pin = pin(before[0]).unwrap();
+            #[cfg(target_os = "macos")]
+            {
+                // A QoS override must not change the original requested state,
+                // even when guards nest or the initial class is unspecified.
+                assert_eq!(requested_qos(), saved_qos);
+                let nested = pin(before[0]).unwrap();
+                assert_eq!(requested_qos(), saved_qos);
+                drop(nested);
+                assert_eq!(requested_qos(), saved_qos);
+            }
             #[cfg(windows)]
             {
                 let mut pinned = native::GroupAffinity::default();
@@ -1236,6 +1319,8 @@ mod tests {
             }
         }
         assert_eq!(cpus(), before);
+        #[cfg(target_os = "macos")]
+        assert_eq!(requested_qos(), saved_qos);
         #[cfg(windows)]
         {
             let mut restored = native::GroupAffinity::default();

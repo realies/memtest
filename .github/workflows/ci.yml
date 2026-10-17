@@ -123,6 +123,30 @@ jobs:
           $python = if ($IsWindows) { 'python' } else { 'python3' }
           & $python scripts/memory-sweep.py $binary memory-sweep
           if ($LASTEXITCODE -ne 0) { throw 'Memory sweep failed' }
+      - name: Run matched cache diagnostic on macOS VM
+        id: cache_diagnostic
+        if: matrix.target == 'aarch64-apple-darwin'
+        run: |
+          $binary = "./target/$env:BUILD_TARGET/release/memtest"
+          $PSNativeCommandUseErrorActionPreference = $false
+          & /bin/sh scripts/cache-sweep.sh $binary --quick 2>&1 | Tee-Object -FilePath cache-diagnostic.log | Tee-Object -Variable sweepOutput
+          $sweepExit = $LASTEXITCODE
+          $directory = $null
+          $destination = @($sweepOutput | Select-String -Pattern '^Results: (.+)$')
+          if ($destination.Count -eq 1 -and (Test-Path -LiteralPath $destination[0].Matches[0].Groups[1].Value -PathType Container)) {
+            $directory = $destination[0].Matches[0].Groups[1].Value
+            "CACHE_SWEEP_DIR=$directory" >> $env:GITHUB_ENV
+            Copy-Item -LiteralPath cache-diagnostic.log -Destination $directory
+          }
+          if ($sweepExit -ne 0) { throw 'Matched cache sweep failed' }
+          if (!$directory) { throw 'Cache sweep did not report its output directory' }
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always() && matrix.target == 'aarch64-apple-darwin' && steps.cache_diagnostic.outcome != 'skipped'
+        with:
+          name: cache-diagnostic-aarch64-apple-darwin
+          path: ${{ env.CACHE_SWEEP_DIR || 'cache-diagnostic.log' }}
+          if-no-files-found: error
+          retention-days: 14
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always() && inputs.memory_sweep
         with:
@@ -152,7 +176,7 @@ jobs:
           $payload = (& $binary --cli --quick --json) -join "`n"
           if ($LASTEXITCODE -ne 0) { throw 'JSON smoke test failed' }
           $result = $payload | ConvertFrom-Json -ErrorAction Stop
-          if ($result -is [array] -or $result.schema -ne 3 -or $result.method -ne 3) {
+          if ($result -is [array] -or $result.schema -ne 3 -or $result.method -ne 4) {
             throw 'Unexpected JSON schema or method'
           }
           if ($result.config.threads -ne 1 -or $result.config.bandwidth_bytes -ne 67108864 -or
@@ -227,7 +251,7 @@ jobs:
             throw 'Automatic profile replay changed fixed settings'
           }
           foreach ($result in @($automatic, $replay)) {
-            if ($result -is [array] -or $result.schema -ne 3 -or $result.method -ne 3 -or
+            if ($result -is [array] -or $result.schema -ne 3 -or $result.method -ne 4 -or
                 $null -eq $result.config.threads -or $null -eq $result.available_cpus -or
                 $result.config.threads -lt 1 -or $result.config.threads -gt $result.available_cpus) {
               throw 'Invalid automatic worker count or JSON schema'

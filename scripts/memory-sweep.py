@@ -61,8 +61,8 @@ def host_details():
 
 
 def validate(result, size, mode):
-    if result.get("schema") != 3 or result.get("method") != 3:
-        raise ValueError("expected memtest schema 3, method 3")
+    if result.get("schema") != 3 or result.get("method") not in (3, 4):
+        raise ValueError("expected memtest schema 3, method 3 or 4")
     expected = {"threads": 2, "bandwidth_bytes": size << 20,
                 "latency_bytes": size << 20, "stores": mode, "samples": 7,
                 "min_time": 0.2, "stride": 128, "window": 2048 << 10, "seed": 1}

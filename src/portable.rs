@@ -743,6 +743,212 @@ pub fn latency(
     Ok(summarize(values))
 }
 
+#[derive(Debug)]
+pub struct CacheProbe {
+    pub target_bytes: usize,
+    pub nodes: usize,
+    pub lower_eviction_bytes: usize,
+    pub cold_eviction_bytes: usize,
+    pub page_bytes: usize,
+    pub cache_line_bytes: usize,
+    pub hot: Measurement,
+    pub capacity_evicted: Measurement,
+    pub cold: Measurement,
+    /// Nanoseconds per dependent load, in trial order, without outlier removal.
+    pub hot_samples: Vec<f64>,
+    pub capacity_evicted_samples: Vec<f64>,
+    pub cold_samples: Vec<f64>,
+}
+
+fn probe_sizes(
+    lower: usize,
+    outer: usize,
+    page: usize,
+    line: usize,
+    samples: usize,
+    budget: usize,
+) -> Result<[usize; 3], String> {
+    if lower == 0 || outer == 0 || samples == 0 || samples > 100 {
+        return Err("cache probe requires positive cache sizes and 1..100 samples".into());
+    }
+    if line < 8 || !line.is_power_of_two() || !page.is_power_of_two() || line > page / 4 {
+        return Err("cache probe requires power-of-two page and cache-line sizes, with at least four lines per page".into());
+    }
+    let target = (lower / 16).clamp(16 * 1024, 256 * 1024) / line * line;
+    if target / line < 64 {
+        return Err("cache probe target must contain at least 64 cache lines".into());
+    }
+    let rounded = |value: Option<usize>| {
+        value
+            .and_then(|n| n.checked_add(line - 1))
+            .map(|n| n / line * line)
+            .ok_or("cache probe size overflow")
+    };
+    let lower_eviction = rounded(lower.checked_mul(2))?;
+    let cold_eviction = rounded(lower.checked_add(outer).and_then(|n| n.checked_mul(4)))?;
+    // Include both guarded allocations, permutation/page-index scratch, and samples.
+    let required = target
+        .checked_add(cold_eviction)
+        .and_then(|n| n.checked_add(512))
+        .and_then(|n| {
+            (target / line + cold_eviction / line)
+                .checked_add(target / page + 2)
+                .and_then(|indices| indices.checked_mul(size_of::<usize>()))
+                .and_then(|scratch| n.checked_add(scratch))
+        })
+        .and_then(|n| {
+            samples
+                .checked_mul(6 * size_of::<f64>())
+                .and_then(|s| n.checked_add(s))
+        })
+        .ok_or("cache probe allocation size overflow")?;
+    if required > budget {
+        return Err(format!(
+            "cache probe requires {required} bytes, exceeding the {budget}-byte memory budget"
+        ));
+    }
+    Ok([target, lower_eviction, cold_eviction])
+}
+
+struct ProbeCycle {
+    start: *const u8,
+    nodes: usize,
+    translations: Vec<usize>,
+}
+
+fn probe_cycle(
+    data: &mut Buffer,
+    line: usize,
+    page: Option<usize>,
+    split: usize,
+) -> Result<ProbeCycle, String> {
+    let mut order = Vec::new();
+    order
+        .try_reserve_exact(data.bytes / line)
+        .map_err(|_| "probe permutation allocation failed")?;
+    let mut translations = Vec::new();
+    if let Some(page) = page {
+        translations
+            .try_reserve_exact(data.bytes / page + 2)
+            .map_err(|_| "probe page-index allocation failed")?;
+    }
+    let (mut previous_page, mut reserved) = (None, 0);
+    for offset in (0..data.bytes).step_by(line) {
+        if let Some(page) = page {
+            let current_page = (data.pointer as usize + offset) / page;
+            if previous_page != Some(current_page) {
+                previous_page = Some(current_page);
+                translations.push(offset);
+                reserved = 2;
+            }
+            // Reserve the first two in-buffer lines on each actual virtual page.
+            // Only the first is read for translation warmup; neither is a chase node.
+            if reserved != 0 {
+                reserved -= 1;
+                continue;
+            }
+        }
+        order.push(offset);
+    }
+    if order.is_empty() {
+        return Err("cache probe has no target nodes".into());
+    }
+    let mut random = Random(0x510e527fade682d1);
+    let shuffle = |nodes: &mut [usize], random: &mut Random| {
+        for i in (1..nodes.len()).rev() {
+            let j = random.below(i + 1);
+            nodes.swap(i, j);
+        }
+    };
+    let boundary = order.partition_point(|&offset| offset < split);
+    shuffle(&mut order[..boundary], &mut random);
+    shuffle(&mut order[boundary..], &mut random);
+    shuffle(&mut translations, &mut random);
+    for index in 0..order.len() {
+        unsafe {
+            data.pointer
+                .add(order[index])
+                .cast::<*const u8>()
+                .write(data.pointer.add(order[(index + 1) % order.len()]));
+        }
+    }
+    Ok(ProbeCycle {
+        start: unsafe { data.pointer.add(order[0]) },
+        nodes: order.len(),
+        translations,
+    })
+}
+
+/// Optional paired capacity-eviction diagnostic, not an SLC residency classifier.
+/// Each condition re-primes the same target and times one traversal only. Evictions
+/// are disjoint dependent walks outside timing; page warmup excludes two target lines
+/// per page. Capacity walks cannot guarantee congruent eviction or exclusive hits.
+#[allow(clippy::too_many_arguments)]
+pub fn cache_probe(
+    lower_bytes: usize,
+    outer_bytes: usize,
+    page_bytes: usize,
+    line_bytes: usize,
+    cpu: usize,
+    samples: usize,
+    memory_budget: usize,
+) -> Result<CacheProbe, String> {
+    let [target_bytes, lower_eviction_bytes, cold_eviction_bytes] = probe_sizes(
+        lower_bytes,
+        outer_bytes,
+        page_bytes,
+        line_bytes,
+        samples,
+        memory_budget,
+    )?;
+    let _pin = platform::pin(cpu)?;
+    let mut target = Buffer::new(target_bytes)?;
+    let mut eviction = Buffer::new(cold_eviction_bytes)?;
+    fill(target.words());
+    fill(eviction.words());
+    let target_cycle = probe_cycle(&mut target, line_bytes, Some(page_bytes), 0)?;
+    // The randomized prefix remains first. Its last pointer returns a suffix address
+    // without loading it when the reduced condition follows exactly prefix_nodes links.
+    let eviction_cycle = probe_cycle(&mut eviction, line_bytes, None, lower_eviction_bytes)?;
+    let eviction_loads = [0, lower_eviction_bytes / line_bytes, eviction_cycle.nodes];
+    let mut values: [Vec<f64>; 3] = std::array::from_fn(|_| Vec::with_capacity(samples));
+    for trial in 0..samples {
+        for step in 0..3 {
+            let condition = (trial + step) % 3;
+            unsafe {
+                black_box(chase(target_cycle.start, target_cycle.nodes));
+                black_box(chase(eviction_cycle.start, eviction_loads[condition]));
+                for &offset in &target_cycle.translations {
+                    black_box(target.pointer.add(offset).cast::<u64>().read_volatile());
+                }
+                black_box(chase(target_cycle.start, 0)); // Complete warmup loads before the clock.
+            }
+            let began = Instant::now();
+            black_box(unsafe { chase(target_cycle.start, target_cycle.nodes) });
+            let seconds = began.elapsed().as_secs_f64();
+            if seconds == 0.0 {
+                return Err("cache probe traversal is shorter than the timer resolution".into());
+            }
+            values[condition].push(seconds * 1e9 / target_cycle.nodes as f64);
+        }
+    }
+    let [hot_samples, capacity_evicted_samples, cold_samples] = values;
+    Ok(CacheProbe {
+        target_bytes,
+        nodes: target_cycle.nodes,
+        lower_eviction_bytes,
+        cold_eviction_bytes,
+        page_bytes,
+        cache_line_bytes: line_bytes,
+        hot: summarize(hot_samples.clone()),
+        capacity_evicted: summarize(capacity_evicted_samples.clone()),
+        cold: summarize(cold_samples.clone()),
+        hot_samples,
+        capacity_evicted_samples,
+        cold_samples,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -759,6 +965,99 @@ mod tests {
                     .all(|&b| b == 0xa5)
             );
         }
+    }
+    #[test]
+    fn probe_sizes_validate_geometry_overflow_and_budget() {
+        let mib = 1024 * 1024;
+        assert_eq!(
+            probe_sizes(12 * mib, 48 * mib, 16384, 128, 21, 1024 * mib).unwrap(),
+            [256 * 1024, 24 * mib, 240 * mib]
+        );
+        for (lower, outer, page, line, samples, budget) in [
+            (0, mib, 4096, 64, 3, 16 * mib),
+            (mib, 0, 4096, 64, 3, 16 * mib),
+            (mib, mib, 0, 64, 3, 16 * mib),
+            (mib, mib, 4096, 63, 3, 16 * mib),
+            (mib, mib, 4096, 2048, 3, 16 * mib),
+            (mib, mib, 4096, 64, 0, 16 * mib),
+            (mib, mib, 4096, 64, 101, 16 * mib),
+            (mib, mib, 4096, 64, 3, mib),
+            (usize::MAX, mib, 4096, 64, 3, usize::MAX),
+        ] {
+            assert!(probe_sizes(lower, outer, page, line, samples, budget).is_err());
+        }
+    }
+    #[test]
+    fn probe_target_cycle_excludes_translation_lines_and_preserves_guards() {
+        for (page, line) in [(4096, 64), (16384, 128), (8192, 256)] {
+            let bytes = 8 * page + 3 * line;
+            let mut data = Buffer::new(bytes).unwrap();
+            fill(data.words());
+            let cycle = probe_cycle(&mut data, line, Some(page), 0).unwrap();
+            let mut seen = vec![false; bytes / line];
+            let mut pointer = cycle.start;
+            for _ in 0..cycle.nodes {
+                let offset = pointer as usize - data.pointer as usize;
+                assert!(offset < bytes && offset.is_multiple_of(line));
+                assert!(!seen[offset / line]);
+                seen[offset / line] = true;
+                pointer = unsafe { pointer.cast::<*const u8>().read() };
+            }
+            assert_eq!(pointer, cycle.start);
+            for offset in (0..bytes).step_by(line) {
+                let current_page = (data.pointer as usize + offset) / page;
+                let anchor = cycle
+                    .translations
+                    .iter()
+                    .copied()
+                    .find(|&anchor| (data.pointer as usize + anchor) / page == current_page)
+                    .unwrap();
+                assert_eq!(seen[offset / line], offset >= anchor + 2 * line);
+            }
+            assert_eq!(unsafe { chase(cycle.start, cycle.nodes) }, cycle.start);
+            let repeated = probe_cycle(&mut data, line, Some(page), 0).unwrap();
+            assert_eq!(repeated.start, cycle.start);
+            assert_eq!(repeated.translations, cycle.translations);
+            guard_check(&data);
+        }
+    }
+    #[test]
+    fn probe_eviction_prefix_visits_only_its_own_region() {
+        let line = 128;
+        let prefix_nodes = 17;
+        let mut data = Buffer::new(65 * line).unwrap();
+        let cycle = probe_cycle(&mut data, line, None, prefix_nodes * line).unwrap();
+        let mut seen = vec![false; cycle.nodes];
+        let mut pointer = cycle.start;
+        for index in 0..cycle.nodes {
+            let offset = pointer as usize - data.pointer as usize;
+            assert!(offset < data.bytes && offset.is_multiple_of(line));
+            assert_eq!(offset < prefix_nodes * line, index < prefix_nodes);
+            assert!(!seen[offset / line]);
+            seen[offset / line] = true;
+            pointer = unsafe { pointer.cast::<*const u8>().read() };
+        }
+        assert_eq!(pointer, cycle.start);
+        let suffix = unsafe { chase(cycle.start, prefix_nodes) };
+        assert!(suffix as usize >= data.pointer as usize + prefix_nodes * line);
+        assert!((suffix as usize) < data.pointer as usize + data.bytes);
+        guard_check(&data);
+    }
+    #[test]
+    fn probe_smoke_returns_raw_samples_without_latency_order_assumptions() {
+        let cpu = platform::cpus()[0];
+        let result = cache_probe(64 * 1024, 128 * 1024, 4096, 64, cpu, 3, 4 * 1024 * 1024).unwrap();
+        for (summary, raw) in [
+            (result.hot, &result.hot_samples),
+            (result.capacity_evicted, &result.capacity_evicted_samples),
+            (result.cold, &result.cold_samples),
+        ] {
+            assert_eq!(raw.len(), 3);
+            assert!(raw.iter().all(|n| n.is_finite() && *n > 0.0));
+            assert_eq!(summary.value, summarize(raw.clone()).value);
+            assert!(summary.spread_percent.is_finite());
+        }
+        assert!(result.nodes * result.cache_line_bytes < result.target_bytes);
     }
     #[test]
     fn backend_selection_is_deterministic_and_checks_availability() {

@@ -8,6 +8,7 @@ mod json;
 mod memory;
 mod platform;
 mod portable;
+mod probe;
 mod profile;
 #[cfg(feature = "gui")]
 mod system_info;
@@ -333,7 +334,7 @@ fn cache_spec(spec: &Spec, plan: &cache::Plan) -> Spec {
         bandwidth_bytes: plan.bandwidth_bytes,
         latency_bytes: plan.working_set_bytes,
         stride: plan.stride,
-        window: 0,
+        window: plan.latency_window(spec.window),
         ..spec.clone()
     }
 }
@@ -489,10 +490,18 @@ pub(crate) fn report_text(report: &Report) -> String {
     if !caches.is_empty() {
         writeln!(
             text,
-            "\nCache       Read GB/s    Write GB/s     Copy GB/s    Latency ns   Workers / BW / latency"
+            "\nCache       Read GB/s    Write GB/s     Copy GB/s    Latency ns   Workers / BW / latency / locality"
         )
         .unwrap();
         for row in caches {
+            let window = row.plan.latency_window(spec.window);
+            let locality = if window == 0 {
+                "full shuffle".into()
+            } else if window.is_multiple_of(1024) {
+                format!("{} KiB blocks", window / 1024)
+            } else {
+                format!("{window} B blocks")
+            };
             let label = row.plan.label();
             let label = label.strip_suffix(" Cache").unwrap_or(&label);
             let rate = |value: Option<portable::Measurement>, divisor: f64| {
@@ -500,7 +509,7 @@ pub(crate) fn report_text(report: &Report) -> String {
             };
             writeln!(
                 text,
-                "{:<6} {:>13} {:>13} {:>13} {:>13}   {} / {} KiB / {} KiB",
+                "{:<6} {:>13} {:>13} {:>13} {:>13}   {} / {} KiB / {} KiB / {locality}",
                 label,
                 rate(row.results.read, 1000.0),
                 rate(row.results.write, 1000.0),
@@ -593,6 +602,9 @@ pub(crate) fn report_json(report: &Report) -> Result<String, String> {
 }
 
 fn run(options: cli::Options) -> Result<(), String> {
+    if options.cache_probe {
+        return probe::run(&options);
+    }
     let report = measure(&options, |progress| match progress {
         Progress::Plan(_plans, _spec, _cpus, _hardware) => {}
         Progress::Stage(_stage) => {}
@@ -698,6 +710,7 @@ mod tests {
         assert_eq!(spec.bandwidth_bytes, 24 << 20);
         assert_eq!(spec.latency_bytes, 24 << 20);
         assert_eq!(spec.stores, portable::Stores::Cached);
+        assert_eq!(spec.window, 2 << 20);
         let mut completed = Vec::new();
         let results = measure_row(
             &options,

@@ -599,6 +599,12 @@ fn rows(
             format!("one worker on CPU {}", plan.cpu)
         };
         let slc = matches!(plan.kind, cache::Kind::Slc);
+        let window = plan.latency_window(spec.window);
+        let locality = if window == 0 {
+            "full shuffle".into()
+        } else {
+            format!("{} random blocks", bytes_text(window))
+        };
         let context = if slc {
             format!(
                 "{} CPU-visible working set · one OS-scheduled worker. Cached loads/stores, decimal GB/s.\n{} published nominal SLC capacity.",
@@ -619,14 +625,14 @@ fn rows(
         );
         let latency = if slc {
             format!(
-                "{} published nominal SLC capacity · {} CPU-visible pointer chain · one OS-scheduled worker · {} B stride. Dependent-load latency in ns.",
+                "{} published nominal SLC capacity · {} CPU-visible pointer chain · one OS-scheduled worker · {} B stride · {locality}. Dependent-load latency in ns.",
                 bytes_text(plan.capacity_bytes),
                 bytes_text(plan.working_set_bytes),
                 plan.stride,
             )
         } else {
             format!(
-                "{} capacity · {} pointer chain · {worker} · {} B stride. Dependent-load latency in ns.",
+                "{} capacity · {} pointer chain · {worker} · {} B stride · {locality}. Dependent-load latency in ns.",
                 bytes_text(plan.capacity_bytes),
                 bytes_text(plan.working_set_bytes),
                 plan.stride,
@@ -1231,6 +1237,13 @@ mod tests {
         );
         assert!(slc.context.contains("24 MiB CPU-visible working set"));
         assert!(slc.context.contains("one OS-scheduled worker"));
+        assert!(
+            slc.cells
+                .row_data(3)
+                .unwrap()
+                .info
+                .contains("2 MiB random blocks")
+        );
         assert!(slc.cells.iter().all(|cell| {
             cell.notes.contains("lower-cache contributions")
                 && cell.notes.contains("SLC-only hits are not guaranteed")

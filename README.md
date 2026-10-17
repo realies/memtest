@@ -85,7 +85,8 @@ for this when the line size is known, and JSON reports the footprint separately.
 
 CPU-cache bandwidth uses cached stores and private worker buffers, bounded
 by half each shared cache's capacity and sized above lower caches. Cache latency uses
-one worker with a fully shuffled, half-capacity buffer and one pointer per cache line.
+one worker, a half-capacity buffer and one pointer per cache line. All latency rows
+honor the selected locality; a complete cycle visits the entire buffer before repeating.
 Lower-cache hits and translation costs still contribute. Unavailable cache tests
 show `N/A` in the GUI; their tooltips explain why.
 
@@ -98,6 +99,12 @@ not a pure SLC measurement or an OS-detected capacity. Unsupported models show
 available. JSON keeps it in a separate `slc` object (or `null`), while `caches`
 contains only CPU levels 1–3.
 
+For hierarchy comparisons, use one worker and cached stores: RAM's automatic
+multicore bandwidth is not a direct comparison with single-worker SLC bandwidth.
+`--cache-probe` separately compares hot data with the same data after small and large
+cache-eviction walks. It reports raw trials; timing differences are evidence of cache
+behavior, not proof that every access hit a particular cache.
+
 By default, each test warms its buffer, calibrates toward 0.2 seconds per sample,
 and reports the median of seven samples. Range is `100 × (maximum − minimum) / median`.
 
@@ -105,10 +112,13 @@ Bandwidth uses decimal MB/s (GB/s for cache displays); latency is ns per depende
 load. JSON includes settings, footprints, placement and ranges. CLI errors use stderr
 and a nonzero exit code. Fixed settings preserve the workload across hosts; scheduling,
 CPU placement, page policy and ISA still affect scores. Windows/Linux pin workers;
-macOS uses OS scheduling. Scores are not directly equivalent to AIDA64.
+macOS uses OS scheduling with a scoped user-initiated QoS floor.
+Scores are not directly equivalent to AIDA64.
 
 `python3 scripts/memory-sweep.py <binary> <output-directory>` compares fixed-worker
 cached and streaming runs at increasing sizes, saving raw JSON and a summary.
 The same optional sweep is available when running CI manually.
+On macOS, `/bin/sh scripts/cache-sweep.sh ./memtest` saves matched one-worker
+measurements across buffer sizes and locality settings, using only built-in OS tools.
 
 <a href="https://slint.dev"><img src="https://raw.githubusercontent.com/slint-ui/slint/v1.18.1/logo/MadeWithSlint-logo-whitebg.png" alt="Made with Slint" width="120"></a>

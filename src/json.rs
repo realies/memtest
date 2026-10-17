@@ -128,13 +128,14 @@ pub fn render(
         };
         if p.kind == crate::cache::Kind::Slc {
             slc = format!(
-                "{{\"name\": \"SLC\", \"capacity_source\": {}, \"access\": \"contiguous_cached\", \"includes_lower_caches\": true, \"capacity_bytes\": {}, \"working_set_bytes\": {}, \"bandwidth_bytes\": {}, \"copy_bytes_per_stream\": {}, \"stride\": {}, \"window\": 0, \"stores\": \"cached\", \"threads\": {}, \"cpu_ids\": {}, \"cpu_id\": {}, \"results\": {{{}}}}}",
+                "{{\"name\": \"SLC\", \"capacity_source\": {}, \"access\": \"contiguous_cached\", \"includes_lower_caches\": true, \"capacity_bytes\": {}, \"working_set_bytes\": {}, \"bandwidth_bytes\": {}, \"copy_bytes_per_stream\": {}, \"stride\": {}, \"window\": {}, \"stores\": \"cached\", \"threads\": {}, \"cpu_ids\": {}, \"cpu_id\": {}, \"results\": {{{}}}}}",
                 quoted(p.source()),
                 p.capacity_bytes,
                 p.working_set_bytes,
                 p.bandwidth_bytes,
                 p.bandwidth_bytes / 2,
                 p.stride,
+                p.latency_window(spec.window),
                 p.cpus.len(),
                 worker_cpus,
                 cpu,
@@ -142,8 +143,8 @@ pub fn render(
             );
         } else {
             cache_rows.push(format!(
-            "{{\"level\": {}, \"capacity_bytes\": {}, \"working_set_bytes\": {}, \"bandwidth_bytes\": {}, \"copy_bytes_per_stream\": {}, \"stride\": {}, \"window\": 0, \"stores\": \"cached\", \"threads\": {}, \"cpu_ids\": {}, \"cpu_id\": {}, \"results\": {{{}}}}}",
-            p.level, p.capacity_bytes, p.working_set_bytes, p.bandwidth_bytes, p.bandwidth_bytes / 2, p.stride, p.cpus.len(), worker_cpus, cpu,
+            "{{\"level\": {}, \"capacity_bytes\": {}, \"working_set_bytes\": {}, \"bandwidth_bytes\": {}, \"copy_bytes_per_stream\": {}, \"stride\": {}, \"window\": {}, \"stores\": \"cached\", \"threads\": {}, \"cpu_ids\": {}, \"cpu_id\": {}, \"results\": {{{}}}}}",
+            p.level, p.capacity_bytes, p.working_set_bytes, p.bandwidth_bytes, p.bandwidth_bytes / 2, p.stride, p.latency_window(spec.window), p.cpus.len(), worker_cpus, cpu,
             measurements(&row.results, &cpu)?));
         }
     }
@@ -157,6 +158,7 @@ pub fn render(
   "backend": {},
   "store_implementation": {},
   "affinity": {},
+  "qos": {},
   "available_cpus": {},
   "cpu_ids": {},
   "worker_selection": {},
@@ -192,6 +194,11 @@ pub fn render(
         quoted(backend.name()),
         quoted(spec.stores.name(backend)),
         quoted(affinity),
+        quoted(if cfg!(target_os = "macos") {
+            "user_initiated_minimum"
+        } else {
+            "default"
+        }),
         hardware.cpus.len(),
         cpu_ids,
         quoted(worker_selection),
@@ -488,7 +495,8 @@ mod tests {
 
     #[test]
     fn slc_results_keep_nominal_geometry_separate_from_reported_cpu_caches() {
-        let (spec, mut hardware) = fixture();
+        let (mut spec, mut hardware) = fixture();
+        spec.window = 2 << 20;
         hardware.affinity = "scheduler";
         let mut rows = vec![crate::cache::Result {
             plan: crate::cache::Plan {
@@ -528,6 +536,19 @@ mod tests {
         assert!(text.contains("\"includes_lower_caches\": true"));
         assert!(text.contains("\"cpu_id\": null"));
         assert!(text.contains("\"latency\": {\"ns\": 25.5"));
+        assert!(text.contains("\"stride\": 128, \"window\": 2097152"));
+        spec.window = 0;
+        let shuffled = render(
+            &spec,
+            &hardware,
+            &[2],
+            "fixed",
+            Backend::Neon,
+            &Results::default(),
+            &rows,
+        )
+        .unwrap();
+        assert!(shuffled.contains("\"stride\": 128, \"window\": 0"));
         rows[0].results.latency.as_mut().unwrap().value = f64::NAN;
         assert!(
             render(

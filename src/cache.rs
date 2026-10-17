@@ -22,6 +22,16 @@ pub struct Plan {
 }
 
 impl Plan {
+    /// Use the selected locality at every hierarchy level. Small cache buffers
+    /// use one window; zero always means a full-buffer permutation.
+    pub fn latency_window(&self, requested: usize) -> usize {
+        if requested == 0 {
+            0
+        } else {
+            requested.max(self.stride).min(self.working_set_bytes) / self.stride * self.stride
+        }
+    }
+
     pub fn label(&self) -> String {
         match self.kind {
             Kind::Cpu => format!("L{} Cache", self.level),
@@ -274,6 +284,17 @@ mod tests {
             ],
         }
     }
+    #[test]
+    fn selected_locality_is_bounded_without_replacing_the_working_set() {
+        let p = plans(&hardware(), &[0], "l3").unwrap().remove(0);
+        assert_eq!(p.working_set_bytes, 4 << 20);
+        assert_eq!(p.latency_window(2 << 20), 2 << 20);
+        assert_eq!(p.latency_window(0), 0);
+        assert_eq!(p.latency_window(8 << 20), 4 << 20);
+        assert_eq!(p.latency_window(8), 64);
+        assert_eq!(p.latency_window(1025), 1024);
+    }
+
     #[test]
     fn footprints_fit_target_and_exceed_lower_cache() {
         let h = hardware();

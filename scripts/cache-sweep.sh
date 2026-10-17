@@ -84,6 +84,8 @@ startup/allocation; page faults are not TLB misses, and context switches do not 
 P/E-core residency. No CPU pinning or hardware counter collection is performed.
 runs.tsv contains individual process medians/ranges; summary.tsv combines both repeats.
 Raw JSON, exact profiles, stderr and process resource statistics are preserved per case.
+If supported by the selected binary, cache-probe.json records paired latency controls;
+cache-probe.tsv summarizes them without identifying any condition as an SLC hit.
 EOF
 cat > "$output/summarize.js" <<'JAVASCRIPT'
 ObjC.import('Foundation');
@@ -96,6 +98,24 @@ function number(value, positive) {
     return typeof value === 'number' && isFinite(value) && (positive ? value > 0 : value >= 0);
 }
 function run(args) {
+    if (args[0] === 'probe') {
+        var probe = JSON.parse(read(args[1])), count = +args[2];
+        if (probe.schema !== 1 || probe.diagnostic !== 'cache_probe' || probe.os !== 'macos' ||
+            probe.affinity !== 'os_scheduled' || probe.cpu_id !== null || probe.samples_per_condition !== count)
+            throw new Error('Unexpected cache-probe schema, placement or trial count');
+        var labels = ['hot', 'capacity_evicted', 'cold'];
+        if (Object.keys(probe.results || {}).length !== labels.length) throw new Error('Missing probe conditions');
+        var summary = ['condition\tmedian_ns\trange_percent\ttrials'];
+        labels.forEach(function(label) {
+            var value = probe.results[label];
+            if (!value || !number(value.ns, true) || !number(value.range_percent, false) ||
+                !Array.isArray(value.samples_ns) || value.samples_ns.length !== count ||
+                !value.samples_ns.every(function(sample) { return number(sample, true); }))
+                throw new Error('Invalid probe measurements: ' + label);
+            summary.push([label, value.ns, value.range_percent, count].join('\t'));
+        });
+        return summary.join('\n');
+    }
     if (args[0] === 'check') {
         var r = JSON.parse(read(args[1]));
         var repeat = +args[2], size = +args[3], test = args[4], locality = args[5];
@@ -180,6 +200,20 @@ for repeat in 1 2; do
 done
 osascript -l JavaScript "$output/summarize.js" summary "$output/runs.tsv" \
     > "$output/summary.tsv" 2> "$output/summary.stderr.txt" || fail 'Cannot summarize results.'
+if grep -q -- '--cache-probe' "$output/help.txt"; then
+    set -- --cli --cache-probe --json
+    trials=21
+    if [ "$quick" = yes ]; then set -- "$@" --quick; trials=5; fi
+    printf '%s\n' 'cache-probe'
+    /usr/bin/time -l -o "$output/cache-probe.time.txt" "$binary" "$@" \
+        > "$output/cache-probe.json" 2> "$output/cache-probe.stderr.txt" \
+        || fail 'Cache probe failed; main sweep outputs are preserved.'
+    osascript -l JavaScript "$output/summarize.js" probe "$output/cache-probe.json" "$trials" \
+        > "$output/cache-probe.tsv" 2> "$output/cache-probe.validation.txt" \
+        || fail 'Cache probe returned invalid JSON; main sweep outputs are preserved.'
+else
+    printf '%s\n' 'Cache probe is not supported by this executable.' > "$output/cache-probe.txt"
+fi
 snapshot > "$output/after.txt"
 date -u '+finished_utc: %Y-%m-%dT%H:%M:%SZ' >> "$output/host.txt"
 complete=yes
