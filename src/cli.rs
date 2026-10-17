@@ -29,6 +29,7 @@ pub struct Options {
     pub quick: bool,
     pub json: bool,
     pub gui: bool,
+    pub cache_probe: bool,
 }
 impl Default for Options {
     fn default() -> Self {
@@ -51,6 +52,7 @@ impl Default for Options {
             quick: false,
             json: false,
             gui: false,
+            cache_probe: false,
         }
     }
 }
@@ -59,6 +61,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Action, String> {
     let mut options = Options::default();
     let mut args = args.into_iter();
     let mut explicit_cli = false;
+    let mut probe_incompatible = None;
     while let Some(argument) = args.next() {
         match argument.as_str() {
             "-h" | "--help" => return Ok(Action::Help),
@@ -79,10 +82,17 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Action, String> {
                 explicit_cli = true;
                 continue;
             }
+            "--cache-probe" => {
+                options.cache_probe = true;
+                continue;
+            }
             "-t" | "--test" | "-j" | "--threads" | "--size-mib" | "--latency-size-mib"
             | "--stride" | "--window-kib" | "--seed" | "--samples" | "--min-time" | "--cpus"
             | "--profile" | "--save-profile" | "--isa" | "--level" | "--stores" => {}
             _ => return Err(format!("unknown option '{argument}'")),
+        }
+        if !matches!(argument.as_str(), "--samples" | "--cpus") {
+            probe_incompatible.get_or_insert_with(|| argument.clone());
         }
         let value = args
             .next()
@@ -136,6 +146,23 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Action, String> {
                     _ => unreachable!(),
                 }
             }
+        }
+    }
+    if options.cache_probe {
+        if options.gui {
+            return Err("--cache-probe and --gui cannot be combined".into());
+        }
+        if let Some(argument) = probe_incompatible {
+            return Err(format!("--cache-probe cannot be combined with {argument}"));
+        }
+        if options.cpus.as_ref().is_some_and(|ids| ids.len() != 1) {
+            return Err("--cache-probe requires exactly one --cpus ID".into());
+        }
+        if options
+            .samples
+            .is_some_and(|count| !(1..=100).contains(&count))
+        {
+            return Err("--cache-probe --samples must be between 1 and 100".into());
         }
     }
     if options.gui && explicit_cli {
@@ -205,6 +232,11 @@ Profiles
       --save-profile <FILE>   Save resolved settings
       --profile <FILE>        Replay settings; explicit options override
 
+Diagnostic
+      --cache-probe           Hot/capacity-evicted/cold latency controls
+                              21 trials; --quick uses 5; --samples overrides
+                              Accepts --cpus <ID>, --json, --cli
+
 General
 {gui_help}      --cli                   Run in the terminal
   -h, --help                  Show help
@@ -219,7 +251,8 @@ Examples
 Streaming uses non-temporal stores on x86, STNP hints on ARM.
 Copy counts bytes read + written and uses two --size-mib RAM buffers.
 Cache bandwidth uses private buffers across cores, with cached stores.
-Cache footprints share half each cache's capacity; latency uses one worker.
+CPU-cache footprints share half the capacity; latency uses one worker.
+On supported Apple Silicon, l3 selects a published-capacity SLC working set.
 Latency uses dependent loads. Missing cache levels are omitted.
 Results are medians; range is 100 * (maximum - minimum) / median.
 Bandwidth uses decimal MB/s. Buffer sizes use MiB/KiB.
@@ -336,5 +369,46 @@ mod tests {
                 .unwrap_err()
                 .contains("GUI support is unavailable")
         );
+    }
+
+    #[test]
+    fn cache_probe_accepts_only_explicit_diagnostic_controls() {
+        let Action::Run(o) = parse(arguments(
+            "--cli --cache-probe --quick --samples 9 --cpus 3 --json",
+        ))
+        .unwrap() else {
+            panic!()
+        };
+        assert!(o.cache_probe && o.quick && o.json);
+        assert_eq!(o.samples, Some(9));
+        assert_eq!(o.cpus, Some(vec![3]));
+        assert!(!Options::default().cache_probe);
+        for input in [
+            "--cache-probe --gui",
+            "--gui --cache-probe",
+            "--cache-probe --cpus 0,1",
+            "--cache-probe --samples 0",
+            "--cache-probe --samples 101",
+            "--cache-probe --profile fixed",
+            "--cache-probe --save-profile fixed",
+            "--cache-probe --test all",
+            "--level all --cache-probe",
+            "--cache-probe --threads 1",
+            "--cache-probe --isa auto",
+            "--cache-probe --stores cached",
+            "--cache-probe --size-mib 64",
+            "--cache-probe --latency-size-mib 16",
+            "--cache-probe --stride 128",
+            "--cache-probe --window-kib 0",
+            "--cache-probe --seed 1",
+            "--cache-probe --min-time 0.2",
+        ] {
+            assert!(
+                parse(arguments(input))
+                    .unwrap_err()
+                    .contains("--cache-probe"),
+                "{input}"
+            );
+        }
     }
 }

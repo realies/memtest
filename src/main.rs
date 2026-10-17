@@ -5,8 +5,10 @@ mod desktop;
 #[cfg(feature = "gui")]
 mod gui;
 mod json;
+mod memory;
 mod platform;
 mod portable;
+mod probe;
 mod profile;
 #[cfg(feature = "gui")]
 mod system_info;
@@ -170,7 +172,7 @@ fn resolve(
             if options.quick {
                 16 << 20
             } else {
-                (256 << 20).max(hardware.cache_bytes.saturating_mul(4))
+                memory::automatic_latency_span(hardware, stride)
             },
             stride,
             memory && (options.test == "all" || options.test == "latency"),
@@ -241,7 +243,7 @@ fn cache_plans(
 }
 
 pub(crate) enum Progress {
-    Plan(Vec<cache::Plan>, Spec, Vec<usize>),
+    Plan(Vec<cache::Plan>, Spec, Vec<usize>, Box<platform::Hardware>),
     Stage(&'static str),
     Test(u8, &'static str),
     Sample(u8, &'static str, usize, usize, f64),
@@ -282,11 +284,16 @@ pub(crate) fn measure(
     } else {
         "fixed"
     };
-    update(Progress::Plan(plans.clone(), spec.clone(), cpus.clone()));
+    let memory = matches!(options.level.as_str(), "all" | "memory");
+    update(Progress::Plan(
+        plans.clone(),
+        spec.clone(),
+        cpus.clone(),
+        Box::new(hardware.clone()),
+    ));
     if let Some(path) = &options.save_profile {
         spec.save(path)?;
     }
-    let memory = matches!(options.level.as_str(), "all" | "memory");
     let results = if memory {
         measure_row(options, backend, &cpus, cpus[0], &spec, 0, &mut update)?
     } else {
@@ -294,15 +301,7 @@ pub(crate) fn measure(
     };
     let mut caches = Vec::new();
     for plan in plans {
-        let cache_spec = Spec {
-            threads: plan.cpus.len(),
-            stores: portable::Stores::Cached,
-            bandwidth_bytes: plan.bandwidth_bytes,
-            latency_bytes: plan.working_set_bytes,
-            stride: plan.stride,
-            window: 0,
-            ..spec.clone()
-        };
+        let cache_spec = cache_spec(&spec, &plan);
         let results = measure_row(
             options,
             backend,
@@ -326,6 +325,18 @@ pub(crate) fn measure(
         results,
         caches,
     })
+}
+
+fn cache_spec(spec: &Spec, plan: &cache::Plan) -> Spec {
+    Spec {
+        threads: plan.cpus.len(),
+        stores: portable::Stores::Cached,
+        bandwidth_bytes: plan.bandwidth_bytes,
+        latency_bytes: plan.working_set_bytes,
+        stride: plan.stride,
+        window: plan.latency_window(spec.window),
+        ..spec.clone()
+    }
 }
 
 fn measure_row(
@@ -479,17 +490,27 @@ pub(crate) fn report_text(report: &Report) -> String {
     if !caches.is_empty() {
         writeln!(
             text,
-            "\nCache       Read GB/s    Write GB/s     Copy GB/s    Latency ns   Workers / BW / latency"
+            "\nCache       Read GB/s    Write GB/s     Copy GB/s    Latency ns   Workers / BW / latency / locality"
         )
         .unwrap();
         for row in caches {
+            let window = row.plan.latency_window(spec.window);
+            let locality = if window == 0 {
+                "full shuffle".into()
+            } else if window.is_multiple_of(1024) {
+                format!("{} KiB blocks", window / 1024)
+            } else {
+                format!("{window} B blocks")
+            };
+            let label = row.plan.label();
+            let label = label.strip_suffix(" Cache").unwrap_or(&label);
             let rate = |value: Option<portable::Measurement>, divisor: f64| {
                 value.map_or_else(|| "—".into(), |v| format!("{:.2}", v.value / divisor))
             };
             writeln!(
                 text,
-                "L{:<5} {:>13} {:>13} {:>13} {:>13}   {} / {} KiB / {} KiB",
-                row.plan.level,
+                "{:<6} {:>13} {:>13} {:>13} {:>13}   {} / {} KiB / {} KiB / {locality}",
+                label,
                 rate(row.results.read, 1000.0),
                 rate(row.results.write, 1000.0),
                 rate(row.results.copy, 1000.0),
@@ -505,6 +526,14 @@ pub(crate) fn report_text(report: &Report) -> String {
             "Caches: aggregate cached bandwidth; single-worker latency, one pointer per cache line."
         )
         .unwrap();
+        if let Some(row) = caches.iter().find(|row| row.plan.kind == cache::Kind::Slc) {
+            writeln!(
+                text,
+                "SLC: {} MiB published nominal capacity; CPU-visible cached working set includes lower-cache hits.",
+                row.plan.capacity_bytes / (1 << 20)
+            )
+            .unwrap();
+        }
     }
     if results.copy.is_some() || caches.iter().any(|c| c.results.copy.is_some()) {
         writeln!(text, "Copy counts bytes read + written; RAM uses two stream-sized buffers, caches split their working set.").unwrap();
@@ -549,6 +578,14 @@ pub(crate) fn report_text(report: &Report) -> String {
         hardware.page_size / 1024
     )
     .unwrap();
+    for warning in memory::warnings(
+        hardware,
+        spec,
+        results.read.is_some() || results.write.is_some() || results.copy.is_some(),
+        results.latency.is_some(),
+    ) {
+        writeln!(text, "Note: {warning}").unwrap();
+    }
     text
 }
 
@@ -565,8 +602,11 @@ pub(crate) fn report_json(report: &Report) -> Result<String, String> {
 }
 
 fn run(options: cli::Options) -> Result<(), String> {
+    if options.cache_probe {
+        return probe::run(&options);
+    }
     let report = measure(&options, |progress| match progress {
-        Progress::Plan(_plans, _spec, _cpus) => {}
+        Progress::Plan(_plans, _spec, _cpus, _hardware) => {}
         Progress::Stage(_stage) => {}
         Progress::Test(_level, _name) => {}
         Progress::Sample(_level, _name, _index, _count, _value) => {}
@@ -627,6 +667,7 @@ mod tests {
     use super::*;
     fn hardware() -> platform::Hardware {
         platform::Hardware {
+            slc_capacity: None,
             cpus: vec![0, 1, 2, 3, 4, 5],
             preferred: vec![0, 2, 4],
             cache_bytes: 32 << 20,
@@ -644,6 +685,55 @@ mod tests {
             panic!()
         };
         o
+    }
+    #[test]
+    fn slc_plan_runs_all_four_measurements_with_the_resolved_working_set() {
+        // Exercise the complete workload on every native CI target. This checks
+        // execution and accounting, not the physical cache of the test machine.
+        let actual = platform::hardware();
+        let cpu = actual.cpus[0];
+        let mut host = actual.clone();
+        host.affinity = "scheduler";
+        host.cache_line_bytes = 128;
+        host.slc_capacity = Some(48 << 20);
+        host.memory_budget = host.memory_budget.max(24 << 20);
+        host.caches = vec![platform::Cache {
+            level: 2,
+            bytes: 12 << 20,
+            line_bytes: 128,
+            cpus: Vec::new(),
+        }];
+        let plan = cache::plans(&host, &[cpu], "l3").unwrap().remove(0);
+        let options = options("--level l3 --threads 1 --samples 1 --min-time 0.001");
+        let (spec, _) = resolve(&options, &host).unwrap();
+        let spec = cache_spec(&spec, &plan);
+        assert_eq!(spec.bandwidth_bytes, 24 << 20);
+        assert_eq!(spec.latency_bytes, 24 << 20);
+        assert_eq!(spec.stores, portable::Stores::Cached);
+        assert_eq!(spec.window, 2 << 20);
+        let mut completed = Vec::new();
+        let results = measure_row(
+            &options,
+            portable::Backend::resolve("auto").unwrap(),
+            &plan.cpus,
+            plan.cpu,
+            &spec,
+            plan.level,
+            &mut |event| {
+                if let Progress::Result(level, label, _) = event {
+                    completed.push((level, label));
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            completed,
+            [(3, "Read"), (3, "Write"), (3, "Copy"), (3, "Latency")]
+        );
+        for result in [results.read, results.write, results.copy, results.latency] {
+            let result = result.unwrap();
+            assert!(result.value.is_finite() && result.value > 0.0);
+        }
     }
     #[test]
     fn automatic_limits_and_explicit_cpu_placement() {
@@ -718,6 +808,7 @@ mod tests {
             let (spec, _) = resolve(&options(input), &hardware).unwrap();
             assert_eq!(spec.bandwidth_bytes, 4 << 20);
             assert_eq!(spec.latency_bytes, 8 << 20);
+            assert!(memory::warnings(&hardware, &spec, true, true).len() >= 2);
         }
         hardware.memory_budget = 0;
         assert!(resolve(&options("--quick"), &hardware).is_err());
@@ -731,6 +822,106 @@ mod tests {
         assert!(resolve(&options("--test read --size-mib 64"), &hardware).is_ok());
         assert!(resolve(&options("--test latency --latency-size-mib 16"), &hardware).is_ok());
     }
+
+    #[test]
+    fn automatic_latency_span_accounts_for_touched_cache_lines() {
+        let mut hardware = hardware();
+        hardware.cache_bytes = 96 << 20;
+        hardware.memory_budget = 8usize << 30;
+        for (line, stride, span_mib) in [
+            (64, 128, 768),
+            (128, 128, 384),
+            (64, 512, 3072),
+            (64, 64, 384),
+        ] {
+            hardware.cache_line_bytes = line;
+            let settings = options(&format!("--test latency --level memory --stride {stride}"));
+            let (spec, _) = resolve(&settings, &hardware).unwrap();
+            assert_eq!(spec.latency_bytes, span_mib << 20);
+            assert_eq!(
+                memory::latency_footprint(&spec, line),
+                Some(4 * hardware.cache_bytes)
+            );
+            assert!(
+                !memory::warnings(&hardware, &spec, false, true)
+                    .iter()
+                    .any(|warning| warning.starts_with("RAM latency:"))
+            );
+        }
+    }
+
+    #[test]
+    fn automatic_latency_span_keeps_floor_budget_and_unknown_geometry() {
+        let mut hardware = hardware();
+        hardware.cache_bytes = 16 << 20;
+        let settings = options("--test latency --level memory");
+        assert_eq!(
+            resolve(&settings, &hardware).unwrap().0.latency_bytes,
+            256 << 20
+        );
+        hardware.cache_bytes = 96 << 20;
+        hardware.memory_budget = 512 << 20;
+        let (limited, _) = resolve(&settings, &hardware).unwrap();
+        assert_eq!(limited.latency_bytes, hardware.memory_budget);
+        assert!(
+            memory::warnings(&hardware, &limited, false, true)
+                .iter()
+                .any(|warning| warning.starts_with("RAM latency:"))
+        );
+        assert_eq!(
+            resolve(&options("--quick"), &hardware)
+                .unwrap()
+                .0
+                .latency_bytes,
+            16 << 20
+        );
+        for line in [0, 256] {
+            hardware.cache_line_bytes = line;
+            let (unknown, _) = resolve(&settings, &hardware).unwrap();
+            assert_eq!(unknown.latency_bytes, 384 << 20);
+            assert!(
+                memory::warnings(&hardware, &unknown, false, true)
+                    .iter()
+                    .any(|warning| warning.contains("unknown"))
+            );
+        }
+        hardware.cache_line_bytes = 64;
+        hardware.cache_bytes = usize::MAX;
+        assert_eq!(
+            resolve(&settings, &hardware).unwrap().0.latency_bytes,
+            hardware.memory_budget
+        );
+    }
+
+    #[test]
+    fn explicit_and_profile_latency_spans_keep_their_fixed_settings() {
+        let mut hardware = hardware();
+        hardware.cache_bytes = 96 << 20;
+        let (saved, _) = resolve(
+            &options("--test latency --level memory --latency-size-mib 384 --threads 2"),
+            &hardware,
+        )
+        .unwrap();
+        assert_eq!(saved.latency_bytes, 384 << 20);
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "memtest-latency-size-profile-{}-{stamp}.profile",
+            std::process::id()
+        ));
+        saved.save(&path).unwrap();
+        let mut settings = options("--test latency --level memory");
+        settings.profile = Some(path.clone());
+        let replayed = resolve(&settings, &hardware);
+        settings.latency_size = Some(0);
+        let automatic = resolve(&settings, &hardware);
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(replayed.unwrap().0, saved);
+        assert_eq!(automatic.unwrap().0.latency_bytes, 768 << 20);
+    }
+
     #[test]
     fn latency_uses_one_cpu_without_rewriting_bandwidth_settings() {
         let (spec, cpus) = resolve(&options("--test latency --threads 8"), &hardware()).unwrap();

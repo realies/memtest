@@ -14,6 +14,10 @@ on:
       tag:
         description: Existing version tag to build when publishing manually
         type: string
+      memory_sweep:
+        description: Compare cached and streaming memory workloads with fixed workers
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -112,6 +116,44 @@ jobs:
           if ($result.schema -ne 3 -or $result.config.threads -ne 1 -or $result.results.read.mb_per_s -le 0 -or $result.results.copy.mb_per_s -le 0) {
             throw 'CLI-only JSON output is invalid'
           }
+      - name: Validate fixed-worker memory sizes and store policies
+        if: inputs.memory_sweep
+        run: |
+          $binary = if ($IsWindows) { "./cli-target/$env:BUILD_TARGET/release/memtest.exe" } else { "./cli-target/$env:BUILD_TARGET/release/memtest" }
+          $python = if ($IsWindows) { 'python' } else { 'python3' }
+          & $python scripts/memory-sweep.py $binary memory-sweep
+          if ($LASTEXITCODE -ne 0) { throw 'Memory sweep failed' }
+      - name: Run matched cache diagnostic on macOS VM
+        id: cache_diagnostic
+        if: matrix.target == 'aarch64-apple-darwin'
+        run: |
+          $binary = "./target/$env:BUILD_TARGET/release/memtest"
+          $PSNativeCommandUseErrorActionPreference = $false
+          & /bin/sh scripts/cache-sweep.sh $binary --quick 2>&1 | Tee-Object -FilePath cache-diagnostic.log | Tee-Object -Variable sweepOutput
+          $sweepExit = $LASTEXITCODE
+          $directory = $null
+          $destination = @($sweepOutput | Select-String -Pattern '^Results: (.+)$')
+          if ($destination.Count -eq 1 -and (Test-Path -LiteralPath $destination[0].Matches[0].Groups[1].Value -PathType Container)) {
+            $directory = $destination[0].Matches[0].Groups[1].Value
+            "CACHE_SWEEP_DIR=$directory" >> $env:GITHUB_ENV
+            Copy-Item -LiteralPath cache-diagnostic.log -Destination $directory
+          }
+          if ($sweepExit -ne 0) { throw 'Matched cache sweep failed' }
+          if (!$directory) { throw 'Cache sweep did not report its output directory' }
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always() && matrix.target == 'aarch64-apple-darwin' && steps.cache_diagnostic.outcome != 'skipped'
+        with:
+          name: cache-diagnostic-aarch64-apple-darwin
+          path: ${{ env.CACHE_SWEEP_DIR || 'cache-diagnostic.log' }}
+          if-no-files-found: error
+          retention-days: 14
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always() && inputs.memory_sweep
+        with:
+          name: memory-sweep-${{ matrix.target }}
+          path: memory-sweep/
+          if-no-files-found: error
+          retention-days: 14
       - name: Native smoke test
         run: |
           $binary = if ($IsWindows) { "./target/$env:BUILD_TARGET/release/memtest.exe" } else { "./target/$env:BUILD_TARGET/release/memtest" }
@@ -134,7 +176,7 @@ jobs:
           $payload = (& $binary --cli --quick --json) -join "`n"
           if ($LASTEXITCODE -ne 0) { throw 'JSON smoke test failed' }
           $result = $payload | ConvertFrom-Json -ErrorAction Stop
-          if ($result -is [array] -or $result.schema -ne 3 -or $result.method -ne 3) {
+          if ($result -is [array] -or $result.schema -ne 3 -or $result.method -ne 4) {
             throw 'Unexpected JSON schema or method'
           }
           if ($result.config.threads -ne 1 -or $result.config.bandwidth_bytes -ne 67108864 -or
@@ -171,6 +213,28 @@ jobs:
                   [double]::IsInfinity($measurement) -or $measurement -le 0) { throw 'Invalid cache result' }
             }
           }
+          if ($null -ne $result.slc) {
+            $slc = $result.slc
+            if ($slc -isnot [pscustomobject] -or $slc.name -ne 'SLC' -or
+                $slc.capacity_source -ne 'published_model' -or $slc.threads -ne 1 -or
+                $slc.working_set_bytes -le 0 -or $slc.working_set_bytes -ge $slc.capacity_bytes -or
+                $slc.bandwidth_bytes -ne $slc.working_set_bytes -or
+                $slc.copy_bytes_per_stream * 2 -ne $slc.bandwidth_bytes -or
+                ($null -ne $slc.cpu_id -and $slc.cpu_id -lt 0) -or
+                ($null -ne $slc.cpu_ids -and (@($slc.cpu_ids).Count -ne 1 -or $slc.cpu_ids[0] -ne $slc.cpu_id)) -or
+                $slc.stride -lt 8 -or
+                $slc.stores -ne 'cached' -or $slc.access -ne 'contiguous_cached') {
+              throw 'Invalid SLC workload metadata'
+            }
+            foreach ($measurement in @($slc.results.read.mb_per_s, $slc.results.write.mb_per_s, $slc.results.copy.mb_per_s, $slc.results.latency.ns)) {
+              if ($null -eq $measurement -or [double]::IsNaN($measurement) -or
+                  [double]::IsInfinity($measurement) -or $measurement -le 0) { throw 'Invalid SLC result' }
+            }
+            foreach ($range in @($slc.results.read.range_percent, $slc.results.write.range_percent, $slc.results.copy.range_percent, $slc.results.latency.range_percent)) {
+              if ($null -eq $range -or [double]::IsNaN($range) -or
+                  [double]::IsInfinity($range) -or $range -lt 0) { throw 'Invalid SLC range' }
+            }
+          }
       - name: Calibrate automatic workers and replay saved profile
         run: |
           $binary = if ($IsWindows) { "./target/$env:BUILD_TARGET/release/memtest.exe" } else { "./target/$env:BUILD_TARGET/release/memtest" }
@@ -187,7 +251,7 @@ jobs:
             throw 'Automatic profile replay changed fixed settings'
           }
           foreach ($result in @($automatic, $replay)) {
-            if ($result -is [array] -or $result.schema -ne 3 -or $result.method -ne 3 -or
+            if ($result -is [array] -or $result.schema -ne 3 -or $result.method -ne 4 -or
                 $null -eq $result.config.threads -or $null -eq $result.available_cpus -or
                 $result.config.threads -lt 1 -or $result.config.threads -gt $result.available_cpus) {
               throw 'Invalid automatic worker count or JSON schema'

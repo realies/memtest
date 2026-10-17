@@ -1,6 +1,6 @@
 use std::{fs::File, io::Read, path::Path};
 
-pub const METHOD: u32 = 3;
+pub const METHOD: u32 = 4;
 pub const DEFAULT_WINDOW: usize = 2 << 20;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -178,8 +178,8 @@ mod tests {
     fn invalid_and_future_profiles_fail_instead_of_changing_work() {
         let text = example().text();
         for bad in [
-            text.replace("method=3", "method=999"),
-            text.replace("method=3", "method=2"),
+            text.replace("method=4", "method=999"),
+            text.replace("method=4", "method=3"),
             text.replace("cache_threads=4", "cache_threads=0"),
             text.replace("stores=streaming", "stores=unknown"),
             text.replace("threads=2", "threads=0"),
