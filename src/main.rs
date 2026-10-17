@@ -300,15 +300,7 @@ pub(crate) fn measure(
     };
     let mut caches = Vec::new();
     for plan in plans {
-        let cache_spec = Spec {
-            threads: plan.cpus.len(),
-            stores: portable::Stores::Cached,
-            bandwidth_bytes: plan.bandwidth_bytes,
-            latency_bytes: plan.working_set_bytes,
-            stride: plan.stride,
-            window: 0,
-            ..spec.clone()
-        };
+        let cache_spec = cache_spec(&spec, &plan);
         let results = measure_row(
             options,
             backend,
@@ -332,6 +324,18 @@ pub(crate) fn measure(
         results,
         caches,
     })
+}
+
+fn cache_spec(spec: &Spec, plan: &cache::Plan) -> Spec {
+    Spec {
+        threads: plan.cpus.len(),
+        stores: portable::Stores::Cached,
+        bandwidth_bytes: plan.bandwidth_bytes,
+        latency_bytes: plan.working_set_bytes,
+        stride: plan.stride,
+        window: 0,
+        ..spec.clone()
+    }
 }
 
 fn measure_row(
@@ -489,13 +493,15 @@ pub(crate) fn report_text(report: &Report) -> String {
         )
         .unwrap();
         for row in caches {
+            let label = row.plan.label();
+            let label = label.strip_suffix(" Cache").unwrap_or(&label);
             let rate = |value: Option<portable::Measurement>, divisor: f64| {
                 value.map_or_else(|| "—".into(), |v| format!("{:.2}", v.value / divisor))
             };
             writeln!(
                 text,
-                "L{:<5} {:>13} {:>13} {:>13} {:>13}   {} / {} KiB / {} KiB",
-                row.plan.level,
+                "{:<6} {:>13} {:>13} {:>13} {:>13}   {} / {} KiB / {} KiB",
+                label,
                 rate(row.results.read, 1000.0),
                 rate(row.results.write, 1000.0),
                 rate(row.results.copy, 1000.0),
@@ -511,6 +517,14 @@ pub(crate) fn report_text(report: &Report) -> String {
             "Caches: aggregate cached bandwidth; single-worker latency, one pointer per cache line."
         )
         .unwrap();
+        if let Some(row) = caches.iter().find(|row| row.plan.kind == cache::Kind::Slc) {
+            writeln!(
+                text,
+                "SLC: {} MiB published nominal capacity; CPU-visible cached working set includes lower-cache hits.",
+                row.plan.capacity_bytes / (1 << 20)
+            )
+            .unwrap();
+        }
     }
     if results.copy.is_some() || caches.iter().any(|c| c.results.copy.is_some()) {
         writeln!(text, "Copy counts bytes read + written; RAM uses two stream-sized buffers, caches split their working set.").unwrap();
@@ -641,6 +655,7 @@ mod tests {
     use super::*;
     fn hardware() -> platform::Hardware {
         platform::Hardware {
+            slc_capacity: None,
             cpus: vec![0, 1, 2, 3, 4, 5],
             preferred: vec![0, 2, 4],
             cache_bytes: 32 << 20,
@@ -658,6 +673,54 @@ mod tests {
             panic!()
         };
         o
+    }
+    #[test]
+    fn slc_plan_runs_all_four_measurements_with_the_resolved_working_set() {
+        // Exercise the complete workload on every native CI target. This checks
+        // execution and accounting, not the physical cache of the test machine.
+        let actual = platform::hardware();
+        let cpu = actual.cpus[0];
+        let mut host = actual.clone();
+        host.affinity = "scheduler";
+        host.cache_line_bytes = 128;
+        host.slc_capacity = Some(48 << 20);
+        host.memory_budget = host.memory_budget.max(24 << 20);
+        host.caches = vec![platform::Cache {
+            level: 2,
+            bytes: 12 << 20,
+            line_bytes: 128,
+            cpus: Vec::new(),
+        }];
+        let plan = cache::plans(&host, &[cpu], "l3").unwrap().remove(0);
+        let options = options("--level l3 --threads 1 --samples 1 --min-time 0.001");
+        let (spec, _) = resolve(&options, &host).unwrap();
+        let spec = cache_spec(&spec, &plan);
+        assert_eq!(spec.bandwidth_bytes, 24 << 20);
+        assert_eq!(spec.latency_bytes, 24 << 20);
+        assert_eq!(spec.stores, portable::Stores::Cached);
+        let mut completed = Vec::new();
+        let results = measure_row(
+            &options,
+            portable::Backend::resolve("auto").unwrap(),
+            &plan.cpus,
+            plan.cpu,
+            &spec,
+            plan.level,
+            &mut |event| {
+                if let Progress::Result(level, label, _) = event {
+                    completed.push((level, label));
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            completed,
+            [(3, "Read"), (3, "Write"), (3, "Copy"), (3, "Latency")]
+        );
+        for result in [results.read, results.write, results.copy, results.latency] {
+            let result = result.unwrap();
+            assert!(result.value.is_finite() && result.value > 0.0);
+        }
     }
     #[test]
     fn automatic_limits_and_explicit_cpu_placement() {

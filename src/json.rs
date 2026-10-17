@@ -99,6 +99,7 @@ pub fn render(
             .unwrap_or_else(|| "null".into())
     };
     let mut cache_rows = Vec::new();
+    let mut slc = "null".to_owned();
     let warnings = crate::memory::warnings(
         hardware,
         spec,
@@ -125,10 +126,26 @@ pub fn render(
         } else {
             format!("{:?}", p.cpus)
         };
-        cache_rows.push(format!(
+        if p.kind == crate::cache::Kind::Slc {
+            slc = format!(
+                "{{\"name\": \"SLC\", \"capacity_source\": {}, \"access\": \"contiguous_cached\", \"includes_lower_caches\": true, \"capacity_bytes\": {}, \"working_set_bytes\": {}, \"bandwidth_bytes\": {}, \"copy_bytes_per_stream\": {}, \"stride\": {}, \"window\": 0, \"stores\": \"cached\", \"threads\": {}, \"cpu_ids\": {}, \"cpu_id\": {}, \"results\": {{{}}}}}",
+                quoted(p.source()),
+                p.capacity_bytes,
+                p.working_set_bytes,
+                p.bandwidth_bytes,
+                p.bandwidth_bytes / 2,
+                p.stride,
+                p.cpus.len(),
+                worker_cpus,
+                cpu,
+                measurements(&row.results, &cpu)?
+            );
+        } else {
+            cache_rows.push(format!(
             "{{\"level\": {}, \"capacity_bytes\": {}, \"working_set_bytes\": {}, \"bandwidth_bytes\": {}, \"copy_bytes_per_stream\": {}, \"stride\": {}, \"window\": 0, \"stores\": \"cached\", \"threads\": {}, \"cpu_ids\": {}, \"cpu_id\": {}, \"results\": {{{}}}}}",
             p.level, p.capacity_bytes, p.working_set_bytes, p.bandwidth_bytes, p.bandwidth_bytes / 2, p.stride, p.cpus.len(), worker_cpus, cpu,
             measurements(&row.results, &cpu)?));
+        }
     }
     Ok(format!(
         r#"{{
@@ -164,7 +181,8 @@ pub fn render(
     "min_time": {}
   }},
   "results": {{{}}},
-  "caches": [{}]
+  "caches": [{}],
+  "slc": {}
 }}
 "#,
         crate::profile::METHOD,
@@ -194,7 +212,8 @@ pub fn render(
         spec.samples,
         spec.min_time,
         measurements(results, &latency_cpu)?,
-        cache_rows.join(", ")
+        cache_rows.join(", "),
+        slc
     ))
 }
 
@@ -216,6 +235,7 @@ mod tests {
                 min_time: 0.001,
             },
             Hardware {
+                slc_capacity: None,
                 cpus: vec![2, 4, 6],
                 preferred: vec![2, 4],
                 cache_bytes: 0,
@@ -406,6 +426,7 @@ mod tests {
         let (spec, mut h) = fixture();
         let mut caches = vec![crate::cache::Result {
             plan: crate::cache::Plan {
+                kind: crate::cache::Kind::Cpu,
                 level: 1,
                 capacity_bytes: 32768,
                 working_set_bytes: 16384,
@@ -437,6 +458,7 @@ mod tests {
         assert!(text.contains("\"copy_bytes_per_stream\": 16384"));
         assert!(text.contains("\"threads\": 2, \"cpu_ids\": [0, 1]"));
         assert!(text.contains("\"copy\": {\"mb_per_s\": 400000"));
+        assert!(text.contains("\"slc\": null"));
         h.affinity = "scheduler";
         let text = render(
             &spec,
@@ -459,6 +481,63 @@ mod tests {
                 Backend::Sse2,
                 &Results::default(),
                 &caches
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn slc_results_keep_nominal_geometry_separate_from_reported_cpu_caches() {
+        let (spec, mut hardware) = fixture();
+        hardware.affinity = "scheduler";
+        let mut rows = vec![crate::cache::Result {
+            plan: crate::cache::Plan {
+                kind: crate::cache::Kind::Slc,
+                level: 3,
+                capacity_bytes: 48 << 20,
+                working_set_bytes: 24 << 20,
+                bandwidth_bytes: 24 << 20,
+                cpus: vec![2],
+                stride: 128,
+                cpu: 2,
+            },
+            results: Results {
+                latency: Some(Measurement {
+                    value: 25.5,
+                    spread_percent: 1.0,
+                }),
+                ..Default::default()
+            },
+        }];
+        let text = render(
+            &spec,
+            &hardware,
+            &[2],
+            "fixed",
+            Backend::Neon,
+            &Results::default(),
+            &rows,
+        )
+        .unwrap();
+        assert!(text.contains("\"caches\": []"));
+        assert!(text.contains("\"slc\": {\"name\": \"SLC\""));
+        assert!(text.contains("\"capacity_source\": \"published_model\""));
+        assert!(text.contains("\"capacity_bytes\": 50331648"));
+        assert!(text.contains("\"working_set_bytes\": 25165824"));
+        assert!(text.contains("\"copy_bytes_per_stream\": 12582912"));
+        assert!(text.contains("\"includes_lower_caches\": true"));
+        assert!(text.contains("\"cpu_id\": null"));
+        assert!(text.contains("\"latency\": {\"ns\": 25.5"));
+        rows[0].results.latency.as_mut().unwrap().value = f64::NAN;
+        assert!(
+            render(
+                &spec,
+                &hardware,
+                &[2],
+                "fixed",
+                Backend::Neon,
+                &Results::default(),
+                &rows
             )
             .is_err()
         );

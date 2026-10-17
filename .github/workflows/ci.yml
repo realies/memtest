@@ -189,6 +189,28 @@ jobs:
                   [double]::IsInfinity($measurement) -or $measurement -le 0) { throw 'Invalid cache result' }
             }
           }
+          if ($null -ne $result.slc) {
+            $slc = $result.slc
+            if ($slc -isnot [pscustomobject] -or $slc.name -ne 'SLC' -or
+                $slc.capacity_source -ne 'published_model' -or $slc.threads -ne 1 -or
+                $slc.working_set_bytes -le 0 -or $slc.working_set_bytes -ge $slc.capacity_bytes -or
+                $slc.bandwidth_bytes -ne $slc.working_set_bytes -or
+                $slc.copy_bytes_per_stream * 2 -ne $slc.bandwidth_bytes -or
+                ($null -ne $slc.cpu_id -and $slc.cpu_id -lt 0) -or
+                ($null -ne $slc.cpu_ids -and (@($slc.cpu_ids).Count -ne 1 -or $slc.cpu_ids[0] -ne $slc.cpu_id)) -or
+                $slc.stride -lt 8 -or
+                $slc.stores -ne 'cached' -or $slc.access -ne 'contiguous_cached') {
+              throw 'Invalid SLC workload metadata'
+            }
+            foreach ($measurement in @($slc.results.read.mb_per_s, $slc.results.write.mb_per_s, $slc.results.copy.mb_per_s, $slc.results.latency.ns)) {
+              if ($null -eq $measurement -or [double]::IsNaN($measurement) -or
+                  [double]::IsInfinity($measurement) -or $measurement -le 0) { throw 'Invalid SLC result' }
+            }
+            foreach ($range in @($slc.results.read.range_percent, $slc.results.write.range_percent, $slc.results.copy.range_percent, $slc.results.latency.range_percent)) {
+              if ($null -eq $range -or [double]::IsNaN($range) -or
+                  [double]::IsInfinity($range) -or $range -lt 0) { throw 'Invalid SLC range' }
+            }
+          }
       - name: Calibrate automatic workers and replay saved profile
         run: |
           $binary = if ($IsWindows) { "./target/$env:BUILD_TARGET/release/memtest.exe" } else { "./target/$env:BUILD_TARGET/release/memtest" }

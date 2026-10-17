@@ -112,6 +112,7 @@ mod tests {
 
     fn hardware() -> Hardware {
         Hardware {
+            slc_capacity: None,
             cpus: vec![0],
             preferred: vec![0],
             caches: Vec::new(),

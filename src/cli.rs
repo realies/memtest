@@ -219,7 +219,8 @@ Examples
 Streaming uses non-temporal stores on x86, STNP hints on ARM.
 Copy counts bytes read + written and uses two --size-mib RAM buffers.
 Cache bandwidth uses private buffers across cores, with cached stores.
-Cache footprints share half each cache's capacity; latency uses one worker.
+CPU-cache footprints share half the capacity; latency uses one worker.
+On supported Apple Silicon, l3 selects a published-capacity SLC working set.
 Latency uses dependent loads. Missing cache levels are omitted.
 Results are medians; range is 100 * (maximum - minimum) / median.
 Bandwidth uses decimal MB/s. Buffer sizes use MiB/KiB.

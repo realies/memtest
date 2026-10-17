@@ -1,8 +1,15 @@
-//! Cache workloads sized against reported data/unified cache-sharing domains.
+//! Cache workloads sized against reported domains or a published Apple SLC model.
 use crate::platform::{Cache, Hardware};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    Cpu,
+    Slc,
+}
 
 #[derive(Clone, Debug)]
 pub struct Plan {
+    pub kind: Kind,
     pub level: u8,
     pub capacity_bytes: usize,
     pub working_set_bytes: usize,
@@ -12,6 +19,22 @@ pub struct Plan {
     pub cpus: Vec<usize>,
     /// Total private Read/Write storage. Copy divides this equally between streams.
     pub bandwidth_bytes: usize,
+}
+
+impl Plan {
+    pub fn label(&self) -> String {
+        match self.kind {
+            Kind::Cpu => format!("L{} Cache", self.level),
+            Kind::Slc => "SLC".into(),
+        }
+    }
+
+    pub fn source(&self) -> &'static str {
+        match self.kind {
+            Kind::Cpu => "os",
+            Kind::Slc => "published_model",
+        }
+    }
 }
 
 pub struct Result {
@@ -92,6 +115,51 @@ pub fn plans(
     cpus: &[usize],
     selected: &str,
 ) -> std::result::Result<Vec<Plan>, String> {
+    plans_with_slc(hardware, cpus, selected, hardware.slc_capacity)
+}
+
+fn slc_plan(hardware: &Hardware, cpus: &[usize], capacity: usize) -> Option<Plan> {
+    let &cpu = cpus.first()?;
+    let stride = hardware.cache_line_bytes;
+    if hardware.affinity != "scheduler" || stride < 8 || !stride.is_power_of_two() {
+        return None;
+    }
+    let lower = hardware
+        .caches
+        .iter()
+        .filter(|cache| {
+            cache.level == 2 && cache.bytes != 0 && cpus.iter().any(|&cpu| applies(cache, cpu))
+        })
+        .map(|cache| cache.bytes)
+        .max()?;
+    let alignment = 256.max(stride);
+    let mut bytes = capacity / 2 / alignment * alignment;
+    if bytes <= lower {
+        bytes = (capacity / 4 * 3) / alignment * alignment;
+    }
+    if bytes <= lower || bytes < alignment || bytes >= capacity || bytes > hardware.memory_budget {
+        return None;
+    }
+    // One scheduled worker keeps the shared budget intact. This cached workload
+    // includes lower-cache hits; its published capacity is not OS L3 geometry.
+    Some(Plan {
+        kind: Kind::Slc,
+        level: 3,
+        capacity_bytes: capacity,
+        working_set_bytes: bytes,
+        stride,
+        cpu,
+        cpus: vec![cpu],
+        bandwidth_bytes: bytes,
+    })
+}
+
+fn plans_with_slc(
+    hardware: &Hardware,
+    cpus: &[usize],
+    selected: &str,
+    slc_capacity: Option<usize>,
+) -> std::result::Result<Vec<Plan>, String> {
     if selected == "memory" {
         return Ok(Vec::new());
     }
@@ -138,6 +206,7 @@ pub fn plans(
             continue;
         }
         plans.push(Plan {
+            kind: Kind::Cpu,
             level,
             capacity_bytes,
             working_set_bytes,
@@ -146,6 +215,13 @@ pub fn plans(
             cpus: workers,
             bandwidth_bytes,
         });
+    }
+    if matches!(selected, "all" | "l3")
+        && !plans.iter().any(|plan| plan.level == 3)
+        && let Some(capacity) = slc_capacity
+        && let Some(plan) = slc_plan(hardware, &cpus, capacity)
+    {
+        plans.push(plan);
     }
     if selected != "all" && plans.is_empty() {
         return Err(format!(
@@ -161,6 +237,7 @@ mod tests {
     use crate::platform::Cache;
     fn hardware() -> Hardware {
         Hardware {
+            slc_capacity: None,
             cpus: vec![0, 1],
             preferred: vec![0, 1],
             cache_bytes: 8 << 20,
@@ -341,5 +418,105 @@ mod tests {
         assert!(p[0].bandwidth_bytes <= h.memory_budget);
         assert!(plans(&h, &[], "all").unwrap().is_empty());
         assert!(plans(&h, &[], "l1").is_err());
+    }
+
+    fn apple_hardware() -> Hardware {
+        let mut h = hardware();
+        h.affinity = "scheduler";
+        h.cache_line_bytes = 128;
+        h.cache_bytes = 12 << 20;
+        h.cache_total_bytes = 24 << 20;
+        h.caches = vec![
+            cache(1, 128 << 10, Vec::new()),
+            cache(2, 4 << 20, Vec::new()),
+            cache(2, 12 << 20, Vec::new()),
+        ];
+        for cache in &mut h.caches {
+            cache.line_bytes = 128;
+        }
+        h
+    }
+
+    #[test]
+    fn slc_working_set_exceeds_largest_l2_without_multiplying_shared_capacity() {
+        let mut h = apple_hardware();
+        for (capacity, bytes) in [(48 << 20, 24 << 20), (24 << 20, 18 << 20)] {
+            h.slc_capacity = Some(capacity);
+            let p = plans(&h, &[1, 0, 1, 999], "l3").unwrap();
+            assert_eq!(p.len(), 1);
+            let p = &p[0];
+            assert_eq!(p.kind, Kind::Slc);
+            assert_eq!(p.level, 3);
+            assert_eq!(p.label(), "SLC");
+            assert_eq!(p.source(), "published_model");
+            assert_eq!(p.capacity_bytes, capacity);
+            assert_eq!(p.working_set_bytes, bytes);
+            assert_eq!(p.bandwidth_bytes, bytes);
+            assert_eq!(p.stride, 128);
+            assert_eq!(p.cpu, 1);
+            assert_eq!(p.cpus, [1]);
+            assert!(p.working_set_bytes > 12 << 20 && p.working_set_bytes < capacity);
+        }
+        assert!(h.caches.iter().all(|cache| cache.level < 3));
+        assert_eq!(h.cache_bytes, 12 << 20);
+        assert_eq!(h.cache_total_bytes, 24 << 20);
+    }
+
+    #[test]
+    fn slc_requires_known_lower_geometry_line_and_sufficient_budget() {
+        let mut h = apple_hardware();
+        assert!(plans_with_slc(&h, &[0], "l3", None).is_err());
+        h.slc_capacity = Some(24 << 20);
+        h.memory_budget = 18 << 20;
+        assert_eq!(
+            plans(&h, &[0], "l3").unwrap()[0].working_set_bytes,
+            18 << 20
+        );
+        for budget in [0, (18 << 20) - 1] {
+            h.memory_budget = budget;
+            assert!(plans(&h, &[0], "l3").is_err());
+        }
+        h.memory_budget = 1 << 30;
+        for line in [0, 3] {
+            h.cache_line_bytes = line;
+            assert!(plans(&h, &[0], "l3").is_err());
+        }
+        h.cache_line_bytes = 128;
+        h.affinity = "hard";
+        assert!(plans(&h, &[0], "l3").is_err());
+        h.affinity = "scheduler";
+        h.slc_capacity = Some(12 << 20);
+        assert!(plans(&h, &[0], "l3").is_err());
+        h.slc_capacity = Some(24 << 20);
+        h.caches.retain(|cache| cache.level != 2);
+        assert!(plans(&h, &[0], "l3").is_err());
+        assert!(plans(&h, &[], "all").unwrap().is_empty());
+    }
+
+    #[test]
+    fn ordinary_l3_has_priority_and_other_selections_do_not_add_slc() {
+        let mut h = apple_hardware();
+        h.slc_capacity = Some(48 << 20);
+        assert!(
+            plans(&h, &[0, 1], "all")
+                .unwrap()
+                .iter()
+                .any(|p| p.kind == Kind::Slc)
+        );
+        for selected in ["memory", "l1", "l2"] {
+            assert!(
+                plans(&h, &[0, 1], selected)
+                    .unwrap()
+                    .iter()
+                    .all(|p| p.kind == Kind::Cpu)
+            );
+        }
+        h.caches.push(cache(3, 64 << 20, Vec::new()));
+        let p = plans(&h, &[0, 1], "l3").unwrap();
+        assert_eq!(p.len(), 1);
+        assert_eq!(p[0].kind, Kind::Cpu);
+        assert_eq!(p[0].label(), "L3 Cache");
+        assert_eq!(p[0].source(), "os");
+        assert_eq!(p[0].capacity_bytes, 64 << 20);
     }
 }

@@ -408,13 +408,15 @@ fn refresh_rows(
             continue;
         };
         let targeted = row.level == i32::from(target.level);
-        if !targeted && row.available && replacement.available {
+        let same_kind = row.label == replacement.label;
+        if !targeted && row.available && replacement.available && same_kind {
             continue;
         }
         if let Some(column) = target.column
             && targeted
             && row.available
             && replacement.available
+            && same_kind
         {
             if let (Some(cells), Some(cell)) = (
                 row.cells.as_any().downcast_ref::<slint::VecModel<Cell>>(),
@@ -424,7 +426,7 @@ fn refresh_rows(
             }
             row.context = "Hover a result for its tested settings.".into();
         } else {
-            // Availability changes discard every stale value and tooltip in the row.
+            // Availability or cache identity changes discard every stale cell.
             row = replacement;
         }
         if let Some(rows) = current
@@ -475,6 +477,12 @@ fn row_name(level: u8) -> String {
     }
 }
 
+fn row_label(rows: &slint::ModelRc<ResultRow>, level: u8) -> String {
+    rows.iter()
+        .find(|row| row.level == i32::from(level))
+        .map_or_else(|| row_name(level), |row| row.label.to_string())
+}
+
 fn bytes_text(bytes: usize) -> String {
     if bytes >= 1 << 20 {
         format!("{} MiB", mib(bytes))
@@ -509,7 +517,7 @@ fn row(level: u8, context: String, copy_context: String, latency_context: String
 fn unavailable_reason(level: u8, hardware: &platform::Hardware, apple_arm: bool) -> String {
     if hardware.caches.iter().all(|cache| cache.level != level) {
         if level == 3 && apple_arm {
-            "macOS did not report CPU L3 cache geometry. Apple SLC is not currently measured."
+            "macOS did not report CPU L3 cache geometry. No supported SLC geometry is available."
                 .into()
         } else {
             format!("L{level} data/unified cache geometry is not reported by this system.")
@@ -590,23 +598,43 @@ fn rows(
         } else {
             format!("one worker on CPU {}", plan.cpu)
         };
-        let context = format!(
-            "{} aggregate working set · {} workers. Cached bandwidth, decimal GB/s.",
-            bytes_text(plan.bandwidth_bytes),
-            plan.cpus.len(),
-        );
+        let slc = matches!(plan.kind, cache::Kind::Slc);
+        let context = if slc {
+            format!(
+                "{} CPU-visible working set · one OS-scheduled worker. Cached loads/stores, decimal GB/s.\n{} published nominal SLC capacity.",
+                bytes_text(plan.bandwidth_bytes),
+                bytes_text(plan.capacity_bytes),
+            )
+        } else {
+            format!(
+                "{} aggregate working set · {} workers. Cached bandwidth, decimal GB/s.",
+                bytes_text(plan.bandwidth_bytes),
+                plan.cpus.len(),
+            )
+        };
         let copy = format!(
             "{context}\n{} source + {} destination share the working set. Copy rate counts combined bytes read + written.",
             bytes_text(plan.bandwidth_bytes / 2),
             bytes_text(plan.bandwidth_bytes / 2)
         );
-        let latency = format!(
-            "{} capacity · {} pointer chain · {worker} · {} B stride. Dependent-load latency in ns.",
-            bytes_text(plan.capacity_bytes),
-            bytes_text(plan.working_set_bytes),
-            plan.stride
-        );
-        rows.push(row(plan.level, context, copy, latency));
+        let latency = if slc {
+            format!(
+                "{} published nominal SLC capacity · {} CPU-visible pointer chain · one OS-scheduled worker · {} B stride. Dependent-load latency in ns.",
+                bytes_text(plan.capacity_bytes),
+                bytes_text(plan.working_set_bytes),
+                plan.stride,
+            )
+        } else {
+            format!(
+                "{} capacity · {} pointer chain · {worker} · {} B stride. Dependent-load latency in ns.",
+                bytes_text(plan.capacity_bytes),
+                bytes_text(plan.working_set_bytes),
+                plan.stride,
+            )
+        };
+        let mut entry = row(plan.level, context, copy, latency);
+        entry.label = plan.label().into();
+        rows.push(entry);
     }
     let method = format!(
         "Method {} · {} · {} samples × {:.3} s · seed {}",
@@ -626,6 +654,8 @@ fn rows(
             .downcast_ref::<slint::VecModel<Cell>>()
             .unwrap();
         for (index, mut cell) in cells.iter().enumerate() {
+            let selected = options.test == "all"
+                || options.test == ["read", "write", "copy", "latency"][index];
             if row.level == 0 {
                 if index == 0 {
                     cell.info = format!(
@@ -635,13 +665,18 @@ fn rows(
                     )
                     .into();
                 }
-                if options.test == "all"
-                    || options.test == ["read", "write", "copy", "latency"][index]
-                {
+                if selected {
                     cell.notes = crate::memory::warnings(hardware, spec, index < 3, index == 3)
                         .join("\n")
                         .into();
                 }
+            } else if selected
+                && plans.iter().any(|plan| {
+                    i32::from(plan.level) == row.level && matches!(plan.kind, cache::Kind::Slc)
+                })
+            {
+                cell.notes = "Published nominal SLC geometry, not OS-reported capacity. CPU-visible results include lower-cache contributions; SLC-only hits are not guaranteed."
+                    .into();
             }
             cell.info = format!("{}\n{method}", cell.info).into();
             cells.set_row_data(index, cell);
@@ -965,7 +1000,10 @@ pub fn run(options: cli::Options) -> Result<(), String> {
                                 window.set_active_column(-1);
                             }
                             Progress::Test(level, label) => {
-                                window.set_status(format!("{} · {label}", row_name(level)).into());
+                                window.set_status(
+                                    format!("{} · {label}", row_label(&window.get_rows(), level))
+                                        .into(),
+                                );
                                 window.set_active_level(i32::from(level));
                                 window.set_active_column(column(label).map_or(-1, |n| n as i32));
                             }
@@ -982,7 +1020,7 @@ pub fn run(options: cli::Options) -> Result<(), String> {
                                 window.set_status(
                                     format!(
                                         "{} · {label} · sample {index} of {count}",
-                                        row_name(level)
+                                        row_label(&window.get_rows(), level)
                                     )
                                     .into(),
                                 );
@@ -1054,12 +1092,13 @@ pub fn run(options: cli::Options) -> Result<(), String> {
                             window.set_status(target.map_or_else(
                                 || "Complete".into(),
                                 |target| {
+                                    let name = row_label(&window.get_rows(), target.level);
                                     let label = target.column.map_or_else(
-                                        || row_name(target.level),
+                                        || name.clone(),
                                         |column| {
                                             format!(
                                                 "{} · {}",
-                                                row_name(target.level),
+                                                name,
                                                 ["Read", "Write", "Copy", "Latency"][column]
                                             )
                                         },
@@ -1150,10 +1189,86 @@ mod tests {
             cache_bytes: 32 << 20,
             cache_total_bytes: 64 << 20,
             cache_line_bytes: 64,
+            slc_capacity: None,
             memory_budget: 1 << 30,
             affinity: "hard",
             page_size: 4096,
         }
+    }
+
+    #[test]
+    fn nominal_slc_identity_and_notes_do_not_survive_a_cpu_cache_replacement() {
+        let hardware = hardware();
+        let options = cli::Options {
+            threads: Some(1),
+            ..Default::default()
+        };
+        let (spec, cpus) = crate::resolve(&options, &hardware).unwrap();
+        let mut plan = cache::Plan {
+            kind: cache::Kind::Slc,
+            level: 3,
+            capacity_bytes: 48 << 20,
+            working_set_bytes: 24 << 20,
+            bandwidth_bytes: 24 << 20,
+            stride: 128,
+            cpu: 0,
+            cpus: vec![0],
+        };
+        let model = rows(
+            &options,
+            &spec,
+            &cpus,
+            std::slice::from_ref(&plan),
+            &hardware,
+            true,
+        );
+        let slc = model.row_data(3).unwrap();
+        assert_eq!(slc.label, "SLC");
+        assert_eq!(row_label(&model, 3), "SLC");
+        assert!(
+            slc.context
+                .contains("48 MiB published nominal SLC capacity")
+        );
+        assert!(slc.context.contains("24 MiB CPU-visible working set"));
+        assert!(slc.context.contains("one OS-scheduled worker"));
+        assert!(slc.cells.iter().all(|cell| {
+            cell.notes.contains("lower-cache contributions")
+                && cell.notes.contains("SLC-only hits are not guaranteed")
+                && !cell.info.contains("streaming")
+        }));
+        assert_eq!(
+            memory_notes(&model)
+                .matches("Published nominal SLC")
+                .count(),
+            1
+        );
+        score(&model, 0, "Read", 60000.0, Some(1.0));
+        for label in ["Read", "Write", "Copy", "Latency"] {
+            score(&model, 3, label, 1000.0, Some(2.0));
+        }
+        let memory = model.row_data(0).unwrap().cells.iter().collect::<Vec<_>>();
+        plan.kind = cache::Kind::Cpu;
+        let model = refresh_rows(
+            model,
+            rows(&options, &spec, &cpus, &[plan], &hardware, true),
+            Some(Target {
+                level: 3,
+                column: Some(0),
+            }),
+        );
+        let cache = model.row_data(3).unwrap();
+        assert_eq!(cache.label, "L3 Cache");
+        assert!(
+            cache
+                .cells
+                .iter()
+                .all(|cell| cell.value.is_empty() && cell.notes.is_empty())
+        );
+        assert_eq!(
+            model.row_data(0).unwrap().cells.iter().collect::<Vec<_>>(),
+            memory
+        );
+        assert!(!memory_notes(&model).contains("Published nominal SLC"));
     }
 
     #[test]
@@ -1211,7 +1326,7 @@ mod tests {
         assert!(unavailable_reason(3, &hardware, false).contains("not reported"));
         let apple = unavailable_reason(3, &hardware, true);
         assert!(apple.contains("macOS did not report CPU L3"));
-        assert!(apple.contains("SLC is not currently measured"));
+        assert!(apple.contains("No supported SLC geometry is available"));
 
         hardware.caches.push(platform::Cache {
             level: 3,
@@ -1447,6 +1562,7 @@ mod tests {
             min_time: 0.001,
         };
         let plans = [cache::Plan {
+            kind: cache::Kind::Cpu,
             level: 2,
             capacity_bytes: 512 << 10,
             working_set_bytes: 256 << 10,
@@ -1601,6 +1717,7 @@ mod tests {
             affinity: "hard",
             page_size: 4096,
             cache_line_bytes: 64,
+            slc_capacity: None,
             caches: Vec::new(),
         };
         let base = cli::Options {

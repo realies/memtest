@@ -1,6 +1,6 @@
 # memtest
 
-An AIDA64-inspired memory and L1/L2/L3 cache benchmark: read, write, copy, and latency,
+An AIDA64-inspired memory and cache benchmark: read, write, copy, and latency,
 with a compact desktop window and a CLI. Rust for Windows, Linux, and macOS
 on x86_64 and ARM64, using seeded access patterns and fixed run settings.
 
@@ -39,8 +39,8 @@ runs select a worker count, then fresh samples measure performance. Explicit
 worker counts and profiles skip selection. `--quick` is a short check; its small
 RAM buffers may fit in cache. Buffer notes appear under Status in the GUI, in CLI
 output, and in JSON's `warnings`. They use a conservative 4× reported-cache
-reference and cannot certify RAM isolation. Apple's SLC is not reported,
-so its coverage remains unknown. Use `--help` for all options.
+reference and cannot certify RAM isolation. Apple's SLC capacity is not reported
+by the OS, so RAM coverage remains unknown. Use `--help` for all options.
 
 Profiles save resolved RAM settings, store policy, and cache worker limits as plain
 text; cache sizes follow each host.
@@ -83,12 +83,20 @@ The touched cache-line footprint can be smaller than the allocated span when
 pointer spacing exceeds the cache-line size; automatic latency sizing accounts
 for this when the line size is known, and JSON reports the footprint separately.
 
-Cache bandwidth uses cached stores and private worker buffers, bounded
+CPU-cache bandwidth uses cached stores and private worker buffers, bounded
 by half each shared cache's capacity and sized above lower caches. Cache latency uses
 one worker with a fully shuffled, half-capacity buffer and one pointer per cache line.
 Lower-cache hits and translation costs still contribute. Unavailable cache tests
-show `N/A` in the GUI; their tooltips explain why. Apple SLC is not currently measured
-as a separate cache and is not substituted for CPU L3.
+show `N/A` in the GUI; their tooltips explain why.
+
+The separate Apple SLC workload uses [published model capacities](https://www.anandtech.com/show/17024/apple-m1-max-performance-review/2):
+24 MiB for M1 Pro and 48 MiB for M1 Max. It uses one OS-scheduled worker and cached
+stores, with half the SLC capacity when that exceeds the largest L2, otherwise
+three quarters if that fits above L2. Lower-cache hits still contribute; this is
+not a pure SLC measurement or an OS-detected capacity. Unsupported models show
+`N/A`. SLC uses the last GUI cache row and `--level l3` when no CPU L3 test is
+available. JSON keeps it in a separate `slc` object (or `null`), while `caches`
+contains only CPU levels 1–3.
 
 By default, each test warms its buffer, calibrates toward 0.2 seconds per sample,
 and reports the median of seven samples. Range is `100 × (maximum − minimum) / median`.
