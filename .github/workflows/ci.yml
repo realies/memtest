@@ -1,379 +1,53 @@
-name: ci
+name: Cache counter discovery
 
 on:
   push:
-    branches: ['**']
-    tags: ['v*']
-  pull_request:
+    branches: [slc-discovery]
   workflow_dispatch:
-    inputs:
-      publish:
-        description: Publish release assets after all six native jobs pass
-        type: boolean
-        default: false
-      tag:
-        description: Existing version tag to build when publishing manually
-        type: string
-      memory_sweep:
-        description: Compare cached and streaming memory workloads with fixed workers
-        type: boolean
-        default: false
 
 permissions:
   contents: read
 
-concurrency:
-  group: ci-${{ github.ref }}-${{ inputs.tag }}
-  cancel-in-progress: ${{ github.ref_type != 'tag' && !inputs.publish }}
-
-env:
-  CARGO_TERM_COLOR: always
-
 jobs:
-  build:
-    name: ${{ matrix.target }}
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 45
+  probe:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - runner: windows-2025
-            target: x86_64-pc-windows-msvc
-          - runner: windows-11-arm
-            target: aarch64-pc-windows-msvc
-          - runner: ubuntu-24.04
-            target: x86_64-unknown-linux-gnu
-          - runner: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
-          - runner: macos-15-intel
-            target: x86_64-apple-darwin
-          - runner: macos-15
-            target: aarch64-apple-darwin
-    defaults:
-      run:
-        shell: pwsh
-    env:
-      RUSTUP_TOOLCHAIN: 1.99.0-${{ matrix.target }}
-      BUILD_TARGET: ${{ matrix.target }}
-      RELEASE_TAG: ${{ inputs.publish && inputs.tag || github.ref_name }}
-      PUBLISH_RELEASE: ${{ github.ref_type == 'tag' || inputs.publish }}
-      # Explicit --target below keeps this flag away from host proc-macros.
-      RUSTFLAGS: ${{ contains(matrix.target, 'windows-msvc') && '-C target-feature=+crt-static' || '' }}
+        runner: [macos-15, macos-26]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
     steps:
-      - name: Validate manual release input
-        if: inputs.publish
-        env:
-          MANUAL_TAG: ${{ inputs.tag }}
-        run: |
-          if ($env:MANUAL_TAG -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?$') {
-            throw 'Publishing requires an existing version tag'
-          }
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ inputs.publish && format('refs/tags/{0}', inputs.tag) || github.sha }}
           persist-credentials: false
-      - name: Install native Rust toolchain
+      - name: Build standalone counter probe
         run: |
-          rustup toolchain install $env:RUSTUP_TOOLCHAIN --profile minimal --component rustfmt
-          if ($LASTEXITCODE -ne 0) { throw 'Rust installation failed' }
-          $compiler = rustc -vV
-          if ($LASTEXITCODE -ne 0) { throw 'rustc failed' }
-          if ($compiler -notcontains "host: $env:BUILD_TARGET") { throw 'Compiler host is not native' }
-          $compiler
-      - name: Install Linux desktop build libraries
-        if: startsWith(matrix.runner, 'ubuntu-')
+          mkdir -p out
+          xcrun clang -std=c11 -O2 -Wall -Wextra -Werror -fblocks \
+            -framework CoreFoundation -framework IOKit \
+            experiments/slc-counters.c -o out/mac-cache-probe
+          codesign --force --sign - out/mac-cache-probe
+      - name: Record host and probe available counters
         run: |
-          sudo apt-get update
-          if ($LASTEXITCODE -ne 0) { throw 'Package index update failed' }
-          sudo apt-get install -y --no-install-recommends pkg-config libfontconfig1-dev libxkbcommon-dev libwayland-dev libx11-dev libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
-          if ($LASTEXITCODE -ne 0) { throw 'Linux desktop library installation failed' }
-      - name: Check formatting
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
-        run: cargo fmt --all --check
-      - name: Check Clippy
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
+          sw_vers > out/host.txt
+          for key in machdep.cpu.brand_string hw.model hw.memsize hw.ncpu hw.pagesize hw.cachelinesize hw.l1dcachesize hw.l2cachesize hw.l3cachesize kern.hv_vmm_present; do
+            sysctl "$key" >> out/host.txt 2>/dev/null || true
+          done
+          ./out/mac-cache-probe out/channels > out/counters.txt 2> out/counters.stderr.txt
+          cat out/counters.txt
+      - name: Inspect memory-controller symbol names
+        if: always()
         run: |
-          rustup component add clippy --toolchain $env:RUSTUP_TOOLCHAIN
-          if ($LASTEXITCODE -ne 0) { throw 'Clippy installation failed' }
-          cargo clippy --all-targets --locked --target $env:BUILD_TARGET -- -D warnings
-          if ($LASTEXITCODE -ne 0) { throw 'GUI Clippy check failed' }
-          cargo clippy --all-targets --locked --no-default-features --target $env:BUILD_TARGET -- -D warnings
-      - name: Build GUI executable
-        run: cargo build --release --locked --target $env:BUILD_TARGET
-      - name: Test
-        run: cargo test --release --locked --target $env:BUILD_TARGET
-      - name: Build and test CLI-only configuration
-        run: |
-          cargo build --release --locked --no-default-features --target $env:BUILD_TARGET --target-dir cli-target
-          if ($LASTEXITCODE -ne 0) { throw 'CLI-only build failed' }
-          cargo test --release --locked --no-default-features --target $env:BUILD_TARGET --target-dir cli-target
-          if ($LASTEXITCODE -ne 0) { throw 'CLI-only tests failed' }
-          $binary = if ($IsWindows) { "./cli-target/$env:BUILD_TARGET/release/memtest.exe" } else { "./cli-target/$env:BUILD_TARGET/release/memtest" }
-          $payload = (& $binary --cli --quick --json) -join "`n"
-          if ($LASTEXITCODE -ne 0) { throw 'CLI-only smoke test failed' }
-          $result = $payload | ConvertFrom-Json -ErrorAction Stop
-          if ($result.schema -ne 3 -or $result.config.threads -ne 1 -or $result.results.read.mb_per_s -le 0 -or $result.results.copy.mb_per_s -le 0) {
-            throw 'CLI-only JSON output is invalid'
-          }
-      - name: Validate fixed-worker memory sizes and store policies
-        if: inputs.memory_sweep
-        run: |
-          $binary = if ($IsWindows) { "./cli-target/$env:BUILD_TARGET/release/memtest.exe" } else { "./cli-target/$env:BUILD_TARGET/release/memtest" }
-          $python = if ($IsWindows) { 'python' } else { 'python3' }
-          & $python scripts/memory-sweep.py $binary memory-sweep
-          if ($LASTEXITCODE -ne 0) { throw 'Memory sweep failed' }
-      - name: Run matched cache diagnostic on macOS VM
-        id: cache_diagnostic
-        if: matrix.target == 'aarch64-apple-darwin'
-        run: |
-          $binary = "./target/$env:BUILD_TARGET/release/memtest"
-          $PSNativeCommandUseErrorActionPreference = $false
-          & /bin/sh scripts/cache-sweep.sh $binary --quick 2>&1 | Tee-Object -FilePath cache-diagnostic.log | Tee-Object -Variable sweepOutput
-          $sweepExit = $LASTEXITCODE
-          $directory = $null
-          $destination = @($sweepOutput | Select-String -Pattern '^Results: (.+)$')
-          if ($destination.Count -eq 1 -and (Test-Path -LiteralPath $destination[0].Matches[0].Groups[1].Value -PathType Container)) {
-            $directory = $destination[0].Matches[0].Groups[1].Value
-            "CACHE_SWEEP_DIR=$directory" >> $env:GITHUB_ENV
-            Copy-Item -LiteralPath cache-diagnostic.log -Destination $directory
-          }
-          if ($sweepExit -ne 0) { throw 'Matched cache sweep failed' }
-          if (!$directory) { throw 'Cache sweep did not report its output directory' }
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        if: always() && matrix.target == 'aarch64-apple-darwin' && steps.cache_diagnostic.outcome != 'skipped'
-        with:
-          name: cache-diagnostic-aarch64-apple-darwin
-          path: ${{ env.CACHE_SWEEP_DIR || 'cache-diagnostic.log' }}
-          if-no-files-found: error
-          retention-days: 14
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        if: always() && inputs.memory_sweep
-        with:
-          name: memory-sweep-${{ matrix.target }}
-          path: memory-sweep/
-          if-no-files-found: error
-          retention-days: 14
-      - name: Native smoke test
-        run: |
-          $binary = if ($IsWindows) { "./target/$env:BUILD_TARGET/release/memtest.exe" } else { "./target/$env:BUILD_TARGET/release/memtest" }
-          foreach ($flag in '--version', '--help') {
-            & $binary --cli $flag
-            if ($LASTEXITCODE -ne 0) { throw 'Native smoke test failed' }
-          }
-          & $binary --cli --quick --save-profile smoke.profile
-          if ($LASTEXITCODE -ne 0) { throw 'Profile save smoke test failed' }
-          if (!(Test-Path -LiteralPath smoke.profile)) { throw 'Profile was not saved' }
-          & $binary --cli --profile smoke.profile --save-profile replay.profile
-          if ($LASTEXITCODE -ne 0) { throw 'Profile replay smoke test failed' }
-          if (!(Test-Path -LiteralPath replay.profile)) { throw 'Replayed profile was not saved' }
-          if ((Get-Content -LiteralPath smoke.profile -Raw) -cne (Get-Content -LiteralPath replay.profile -Raw)) {
-            throw 'Profile replay changed fixed settings'
-          }
-      - name: Validate JSON output
-        run: |
-          $binary = if ($IsWindows) { "./target/$env:BUILD_TARGET/release/memtest.exe" } else { "./target/$env:BUILD_TARGET/release/memtest" }
-          $payload = (& $binary --cli --quick --json) -join "`n"
-          if ($LASTEXITCODE -ne 0) { throw 'JSON smoke test failed' }
-          $result = $payload | ConvertFrom-Json -ErrorAction Stop
-          if ($result -is [array] -or $result.schema -ne 3 -or $result.method -ne 4) {
-            throw 'Unexpected JSON schema or method'
-          }
-          if ($result.config.threads -ne 1 -or $result.config.bandwidth_bytes -ne 67108864 -or
-              $result.config.latency_bytes -ne 16777216 -or $result.config.samples -ne 3 -or
-              $result.config.stride -ne 128 -or $result.config.window -ne 2097152 -or
-              $result.config.cache_threads -ne 1 -or $result.config.stores -ne 'streaming' -or
-              $result.config.seed -ne 1 -or $result.config.min_time -ne 0.01) {
-            throw 'JSON quick-run settings are incorrect'
-          }
-          foreach ($measurement in @($result.results.read.mb_per_s, $result.results.write.mb_per_s, $result.results.copy.mb_per_s, $result.results.latency.ns)) {
-            if ($null -eq $measurement -or [double]::IsNaN($measurement) -or
-                [double]::IsInfinity($measurement) -or $measurement -le 0) {
-              throw 'JSON measurement must be finite and positive'
-            }
-          }
-          foreach ($range in @($result.results.read.range_percent, $result.results.write.range_percent, $result.results.copy.range_percent, $result.results.latency.range_percent)) {
-            if ($null -eq $range -or [double]::IsNaN($range) -or
-                [double]::IsInfinity($range) -or $range -lt 0) {
-              throw 'JSON range must be finite and non-negative'
-            }
-          }
-          if ($result.copy_convention -ne 'read_plus_write_bytes') { throw 'Unexpected Copy units' }
-          $levels = @()
-          foreach ($cache in $result.caches) {
-            if ($cache.level -notin @(1, 2, 3) -or $cache.level -in $levels -or
-                $cache.threads -ne 1 -or $cache.working_set_bytes -gt ($cache.capacity_bytes / 2) -or
-                $cache.working_set_bytes -le 0 -or $cache.stride -lt 8 -or
-                $cache.copy_bytes_per_stream * 2 -ne $cache.bandwidth_bytes -or $cache.stores -ne 'cached') {
-              throw 'Invalid cache workload metadata'
-            }
-            $levels += $cache.level
-            foreach ($measurement in @($cache.results.read.mb_per_s, $cache.results.write.mb_per_s, $cache.results.copy.mb_per_s, $cache.results.latency.ns)) {
-              if ($null -eq $measurement -or [double]::IsNaN($measurement) -or
-                  [double]::IsInfinity($measurement) -or $measurement -le 0) { throw 'Invalid cache result' }
-            }
-          }
-          if ($null -ne $result.slc) {
-            $slc = $result.slc
-            if ($slc -isnot [pscustomobject] -or $slc.name -ne 'SLC' -or
-                $slc.capacity_source -ne 'published_model' -or $slc.threads -ne 1 -or
-                $slc.working_set_bytes -le 0 -or $slc.working_set_bytes -ge $slc.capacity_bytes -or
-                $slc.bandwidth_bytes -ne $slc.working_set_bytes -or
-                $slc.copy_bytes_per_stream * 2 -ne $slc.bandwidth_bytes -or
-                ($null -ne $slc.cpu_id -and $slc.cpu_id -lt 0) -or
-                ($null -ne $slc.cpu_ids -and (@($slc.cpu_ids).Count -ne 1 -or $slc.cpu_ids[0] -ne $slc.cpu_id)) -or
-                $slc.stride -lt 8 -or
-                $slc.stores -ne 'cached' -or $slc.access -ne 'contiguous_cached') {
-              throw 'Invalid SLC workload metadata'
-            }
-            foreach ($measurement in @($slc.results.read.mb_per_s, $slc.results.write.mb_per_s, $slc.results.copy.mb_per_s, $slc.results.latency.ns)) {
-              if ($null -eq $measurement -or [double]::IsNaN($measurement) -or
-                  [double]::IsInfinity($measurement) -or $measurement -le 0) { throw 'Invalid SLC result' }
-            }
-            foreach ($range in @($slc.results.read.range_percent, $slc.results.write.range_percent, $slc.results.copy.range_percent, $slc.results.latency.range_percent)) {
-              if ($null -eq $range -or [double]::IsNaN($range) -or
-                  [double]::IsInfinity($range) -or $range -lt 0) { throw 'Invalid SLC range' }
-            }
-          }
-      - name: Calibrate automatic workers and replay saved profile
-        run: |
-          $binary = if ($IsWindows) { "./target/$env:BUILD_TARGET/release/memtest.exe" } else { "./target/$env:BUILD_TARGET/release/memtest" }
-          $payload = (& $binary --cli --test read --size-mib 256 --samples 3 --min-time 0.01 --save-profile automatic.profile --json) -join "`n"
-          if ($LASTEXITCODE -ne 0) { throw 'Automatic worker calibration failed' }
-          $automatic = $payload | ConvertFrom-Json -ErrorAction Stop
-          if ($automatic.worker_selection -ne 'calibrated') { throw 'Automatic workers were not calibrated' }
-          if (!(Test-Path -LiteralPath automatic.profile)) { throw 'Automatic profile was not saved' }
-          $payload = (& $binary --cli --profile automatic.profile --test read --json) -join "`n"
-          if ($LASTEXITCODE -ne 0) { throw 'Automatic profile replay failed' }
-          $replay = $payload | ConvertFrom-Json -ErrorAction Stop
-          if ($replay.worker_selection -ne 'fixed') { throw 'Profile replay recalibrated worker selection' }
-          if (($automatic.config | ConvertTo-Json -Compress) -cne ($replay.config | ConvertTo-Json -Compress)) {
-            throw 'Automatic profile replay changed fixed settings'
-          }
-          foreach ($result in @($automatic, $replay)) {
-            if ($result -is [array] -or $result.schema -ne 3 -or $result.method -ne 4 -or
-                $null -eq $result.config.threads -or $null -eq $result.available_cpus -or
-                $result.config.threads -lt 1 -or $result.config.threads -gt $result.available_cpus) {
-              throw 'Invalid automatic worker count or JSON schema'
-            }
-            if ($result.config.bandwidth_bytes -ne 268435456 -or
-                $result.config.samples -ne 3 -or $result.config.min_time -ne 0.01) {
-              throw 'Automatic run changed explicitly selected settings'
-            }
-            $measurement = $result.results.read.mb_per_s
-            $range = $result.results.read.range_percent
-            if ($null -eq $measurement -or [double]::IsNaN($measurement) -or
-                [double]::IsInfinity($measurement) -or $measurement -le 0 -or
-                $null -eq $range -or [double]::IsNaN($range) -or
-                [double]::IsInfinity($range) -or $range -lt 0) {
-              throw 'Automatic read result must be finite and positive with a non-negative range'
-            }
-          }
-      - name: Reject invalid profiles
-        run: |
-          $binary = if ($IsWindows) { "./target/$env:BUILD_TARGET/release/memtest.exe" } else { "./target/$env:BUILD_TARGET/release/memtest" }
-          $PSNativeCommandUseErrorActionPreference = $false
-          $valid = Get-Content -LiteralPath smoke.profile -Raw
-          $invalid = [ordered]@{
-            malformed = 'this is not a key=value profile'
-            future = $valid -replace '(?m)^method=.*$', 'method=999'
-            duration = $valid -replace '(?m)^min_time=.*$', 'min_time=NaN'
-            samples = $valid -replace '(?m)^samples=.*$', 'samples=0'
-            duplicate = "$valid`nseed=2"
-          }
-          foreach ($case in $invalid.Keys) {
-            Set-Content -LiteralPath "$case.profile" -Value $invalid[$case] -Encoding utf8
-            & $binary --cli --profile "$case.profile"
-            if ($LASTEXITCODE -eq 0) { throw "Invalid profile '$case' was accepted" }
-          }
-          & $binary --cli --profile missing.profile
-          if ($LASTEXITCODE -eq 0) { throw 'Missing profile was accepted' }
-          $global:LASTEXITCODE = 0
-      - name: Run memory benchmark
-        run: |
-          $binary = if ($IsWindows) { "./target/$env:BUILD_TARGET/release/memtest.exe" } else { "./target/$env:BUILD_TARGET/release/memtest" }
-          & $binary --cli --threads 1 --size-mib 512 --latency-size-mib 512 --stride 128 --window-kib 0 --seed 1 --samples 7 --min-time 0.2 --save-profile benchmark.profile | Tee-Object -FilePath benchmark.txt
-          if ($LASTEXITCODE -ne 0) { throw 'Memory benchmark failed' }
-          @("### memtest - $env:BUILD_TARGET", '', '```text', (Get-Content -LiteralPath benchmark.txt -Raw).TrimEnd(), '```') | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: benchmark-${{ matrix.target }}
-          path: |
-            benchmark.txt
-            benchmark.profile
-          if-no-files-found: error
-          retention-days: 14
-      - name: Package tested executable
-        id: package
-        run: |
-          $metadata = cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json
-          if ($LASTEXITCODE -ne 0) { throw 'Cargo metadata failed' }
-          $version = ($metadata.packages | Where-Object name -eq 'memtest').version
-          if (!$version) { throw 'memtest package version is missing' }
-          if ($env:PUBLISH_RELEASE -eq 'true') {
-            if ($env:RELEASE_TAG -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?$') { throw 'Invalid release tag' }
-            if ($env:RELEASE_TAG -ne "v$version") { throw 'Tag must match Cargo package version' }
-          }
-          $name = "memtest-v$version-$env:BUILD_TARGET"
-          "name=$name" >> $env:GITHUB_OUTPUT
-          New-Item -ItemType Directory -Path "package/$name/assets", dist -Force | Out-Null
-          $binary = if ($IsWindows) { "target/$env:BUILD_TARGET/release/memtest.exe" } else { "target/$env:BUILD_TARGET/release/memtest" }
-          Copy-Item -LiteralPath $binary -Destination "package/$name/"
-          Copy-Item -LiteralPath README.md -Destination "package/$name/"
-          $python = if ($IsWindows) { 'python' } else { 'python3' }
-          & $python scripts/notices.py --target $env:BUILD_TARGET --output "package/$name/THIRD_PARTY_NOTICES.txt"
-          if ($LASTEXITCODE -ne 0) { throw 'Dependency notice generation failed' }
-          if (Test-Path -LiteralPath LICENSE) { Copy-Item -LiteralPath LICENSE -Destination "package/$name/" }
-          Copy-Item -LiteralPath assets/screenshot.png -Destination "package/$name/assets/"
-          if ($IsWindows) {
-            Compress-Archive -Path "package/$name" -DestinationPath "dist/$name.zip"
-          } else {
-            tar -czf "dist/$name.tar.gz" -C package $name
-            if ($LASTEXITCODE -ne 0) { throw 'Archive creation failed' }
-          }
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: ${{ steps.package.outputs.name }}
-          path: dist/*
-          if-no-files-found: error
-          retention-days: 14
-
-  release:
-    name: Publish tested release assets
-    needs: build
-    if: (github.event_name == 'push' && github.ref_type == 'tag') || (github.event_name == 'workflow_dispatch' && inputs.publish)
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          pattern: memtest-*
-          path: dist
-          merge-multiple: true
-      - name: Create release and checksums
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ inputs.publish && inputs.tag || github.ref_name }}
-        run: |
-          set -euo pipefail
-          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]
-          visibility=$(gh api "repos/$GITHUB_REPOSITORY" --jq '.visibility')
-          if [[ "$visibility" != public ]]; then
-            echo 'Publishing requires a public repository for the Slint attribution badge.' >&2
-            exit 1
+          image=/System/Library/KernelCollections/BootKernelExtensions.kc
+          if [ -r "$image" ]; then
+            strings -a "$image" | LC_ALL=C awk 'tolower($0) ~ /slc|memcachecontroller|applemcc/ && length($0) < 240 { if (++n <= 200) print }' > out/controller-symbols.txt
+          else
+            printf '%s\n' 'Kernel collection is not available on this runner.' > out/controller-symbols.txt
           fi
-          shopt -s nullglob
-          assets=(dist/memtest-*.zip dist/memtest-*.tar.gz)
-          [[ ${#assets[@]} -eq 6 ]]
-          (cd dist && sha256sum memtest-*.zip memtest-*.tar.gz > "memtest-$RELEASE_TAG-SHA256SUMS")
-          prerelease=()
-          [[ "$RELEASE_TAG" != *-* ]] || prerelease=(--prerelease)
-          notes=$(mktemp)
-          trap 'rm -f "$notes"' EXIT
-          printf '%s\n' '<a href="https://slint.dev"><img src="https://raw.githubusercontent.com/slint-ui/slint/v1.18.1/logo/MadeWithSlint-logo-whitebg.png" alt="Made with Slint" width="120"></a>' > "$notes"
-          gh release create "$RELEASE_TAG" dist/* --repo "$GITHUB_REPOSITORY" \
-            --verify-tag --title "memtest $RELEASE_TAG" --notes-file "$notes" \
-            --generate-notes "${prerelease[@]}"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: cache-counter-probe-${{ matrix.runner }}
+          path: out/
+          if-no-files-found: error
+          retention-days: 14
