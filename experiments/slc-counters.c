@@ -4,6 +4,7 @@
 // API declarations cross-checked against kennss/SiliconScope Sources/CIOReport and
 // vladkens/macmon. IOReport is private and may change; missing/rejected data stays unavailable.
 #include <CoreFoundation/CoreFoundation.h>
+#include <IOKit/IOKitLib.h>
 #include <dlfcn.h>
 #include <errno.h>
 #include <inttypes.h>
@@ -19,6 +20,7 @@
 
 typedef void *Subscription;
 typedef struct {
+    CFMutableDictionaryRef (*IOReportCopyAllChannels)(uint64_t, uint64_t);
     CFMutableDictionaryRef (*IOReportCopyChannelsInGroup)(CFStringRef, CFStringRef, uint64_t, uint64_t, uint64_t);
     Subscription (*IOReportCreateSubscription)(void *, CFMutableDictionaryRef, CFMutableDictionaryRef *, uint64_t, CFTypeRef);
     CFDictionaryRef (*IOReportCreateSamples)(Subscription, CFMutableDictionaryRef, CFTypeRef);
@@ -33,11 +35,15 @@ typedef struct {
 } API;
 static API api;
 
+static void sanitize(char *text) {
+    for (unsigned char *p = (unsigned char *)text; *p; ++p)
+        if (*p < 32 || *p == 127) *p = ' ';
+}
+
 static void string_value(CFStringRef value, char *output, size_t size) {
     if (!value || !CFStringGetCString(value, output, (CFIndex)size, kCFStringEncodingUTF8))
         snprintf(output, size, "<unavailable>");
-    for (char *p = output; *p; ++p)
-        if (*p == '\n' || *p == '\r' || *p == '\t') *p = ' ';
+    sanitize(output);
 }
 
 static CFArrayRef channel_array(CFDictionaryRef dictionary) {
@@ -50,6 +56,96 @@ static CFArrayRef channel_array(CFDictionaryRef dictionary) {
 static CFIndex channel_count(CFDictionaryRef dictionary) {
     CFArrayRef array = channel_array(dictionary);
     return array ? CFArrayGetCount(array) : 0;
+}
+
+static void increment(CFMutableDictionaryRef counts, CFStringRef key) {
+    int64_t count = 0;
+    CFNumberRef old = CFDictionaryGetValue(counts, key);
+    if (old) CFNumberGetValue(old, kCFNumberSInt64Type, &count);
+    ++count;
+    CFNumberRef number = CFNumberCreate(NULL, kCFNumberSInt64Type, &count);
+    if (number) {
+        CFDictionarySetValue(counts, key, number);
+        CFRelease(number);
+    }
+}
+
+static void print_count(const void *key, const void *value, void *context) {
+    char name[512];
+    int64_t count = 0;
+    string_value((CFStringRef)key, name, sizeof name);
+    CFNumberGetValue((CFNumberRef)value, kCFNumberSInt64Type, &count);
+    printf("%s\t%s\t%" PRId64 "\n", (const char *)context, name, count);
+}
+
+static void inventory_groups(void) {
+    if (!api.IOReportCopyAllChannels) {
+        puts("status\tall-channels\tsymbol_unavailable");
+        return;
+    }
+    CFMutableDictionaryRef channels = api.IOReportCopyAllChannels(0, 0);
+    CFArrayRef array = channel_array(channels);
+    if (!array) {
+        puts("status\tall-channels\tunavailable_channel_array");
+        if (channels) CFRelease(channels);
+        return;
+    }
+    printf("status\tall-channels\tchannels\t%ld\n", (long)CFArrayGetCount(array));
+    CFMutableDictionaryRef counts = CFDictionaryCreateMutable(NULL, 0,
+        &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    if (counts) {
+        for (CFIndex i = 0; i < CFArrayGetCount(array); ++i) {
+            CFTypeRef item = CFArrayGetValueAtIndex(array, i);
+            if (!item || CFGetTypeID(item) != CFDictionaryGetTypeID()) continue;
+            CFStringRef group = api.IOReportChannelGetGroup((CFDictionaryRef)item);
+            if (!group || CFGetTypeID(group) != CFStringGetTypeID()) group = CFSTR("<unavailable>");
+            increment(counts, group);
+        }
+        CFDictionaryApplyFunction(counts, print_count, "group");
+        CFRelease(counts);
+    } else {
+        puts("status\tall-channels\tallocation_failed");
+    }
+    CFRelease(channels);
+}
+
+static void inventory_services(void) {
+    const char *classes[] = {"AppleMemCacheController", "AppleVirtualPlatformARMPE",
+                            "AppleARMIODevice", "IOReportHub"};
+    for (size_t i = 0; i < sizeof classes / sizeof *classes; ++i) {
+        CFMutableDictionaryRef matching = IOServiceMatching(classes[i]);
+        if (!matching) {
+            printf("service\t%s\tmatching_unavailable\n", classes[i]);
+            continue;
+        }
+        io_iterator_t iterator = IO_OBJECT_NULL;
+        // IOServiceGetMatchingServices consumes the matching dictionary.
+        kern_return_t result = IOServiceGetMatchingServices(kIOMainPortDefault, matching, &iterator);
+        if (result != KERN_SUCCESS) {
+            printf("service\t%s\tquery_failed\t0x%08" PRIx32 "\n", classes[i], (uint32_t)result);
+            continue;
+        }
+        CFMutableDictionaryRef counts = CFDictionaryCreateMutable(NULL, 0,
+            &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+        unsigned long count = 0;
+        io_service_t service;
+        while ((service = IOIteratorNext(iterator)) != IO_OBJECT_NULL) {
+            ++count;
+            io_name_t name;
+            if (counts && IOObjectGetClass(service, name) == KERN_SUCCESS) {
+                CFStringRef string = CFStringCreateWithCString(NULL, name, kCFStringEncodingUTF8);
+                if (string) { increment(counts, string); CFRelease(string); }
+            }
+            IOObjectRelease(service);
+        }
+        IOObjectRelease(iterator);
+        printf("service\t%s\tcount\t%lu\n", classes[i], count);
+        if (counts) {
+            printf("service-class-query\t%s\n", classes[i]);
+            CFDictionaryApplyFunction(counts, print_count, "service-class");
+            CFRelease(counts);
+        }
+    }
 }
 
 static void print_channels(const char *phase, CFDictionaryRef dictionary, bool read_values) {
@@ -186,10 +282,11 @@ int main(int argc, char **argv) {
     char temporary[] = "/tmp/memtest-ioreport.XXXXXX";
     const char *directory = argc == 2 ? argv[1] : mkdtemp(temporary);
     if (!directory || (argc == 2 && mkdir(directory, 0700) != 0)) { perror("output directory"); return 1; }
-    printf("IOReport availability diagnostic; ordinary user uid=%lu\n", (unsigned long)getuid());
+    printf("IOReport availability diagnostic; uid=%lu\n", (unsigned long)getuid());
     printf("Output directory: %s\n", directory);
     puts("System-wide counter deltas only; no process attribution, cache-size inference or cache-hit percentage.");
     puts("Columns: channel / phase / group / subgroup / name / id / unit / format / raw_value_or_status");
+    inventory_services();
     void *library = dlopen("/usr/lib/libIOReport.dylib", RTLD_NOW | RTLD_LOCAL);
     if (!library) { fprintf(stderr, "IOReport unavailable: %s\n", dlerror()); return 1; }
 #define REQUIRED(symbol) do { \
@@ -206,8 +303,10 @@ int main(int argc, char **argv) {
     REQUIRED(IOReportChannelGetFormat);
     REQUIRED(IOReportSimpleGetIntegerValue);
 #undef REQUIRED
+    api.IOReportCopyAllChannels = (__typeof__(api.IOReportCopyAllChannels))dlsym(library, "IOReportCopyAllChannels");
     api.IOReportChannelGetUnitLabel = (__typeof__(api.IOReportChannelGetUnitLabel))dlsym(library, "IOReportChannelGetUnitLabel");
     api.IOReportChannelGetChannelID = (__typeof__(api.IOReportChannelGetChannelID))dlsym(library, "IOReportChannelGetChannelID");
+    inventory_groups();
     const struct { const char *label; CFStringRef group; CFStringRef subgroup; } queries[] = {
         {"amc-all", CFSTR("AMC Stats"), NULL},
         {"amc-dsid", CFSTR("AMC Stats"), CFSTR("DSID Group Stats")},

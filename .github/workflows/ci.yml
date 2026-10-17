@@ -35,6 +35,11 @@ jobs:
           done
           ./out/mac-cache-probe out/channels > out/counters.txt 2> out/counters.stderr.txt
           cat out/counters.txt
+      - name: Compare root visibility inside the guest
+        run: |
+          sudo -n ./out/mac-cache-probe out/root-channels > out/counters-root.txt 2> out/counters-root.stderr.txt
+          sudo -n chown -R "$(id -u):$(id -g)" out/root-channels
+          cat out/counters-root.txt
       - name: Inspect memory-controller symbol names
         if: always()
         run: |
